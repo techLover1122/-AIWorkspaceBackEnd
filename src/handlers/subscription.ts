@@ -1,650 +1,441 @@
-﻿import { Context } from "hono";
-import * as pty from "node-pty";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { info, debug as logDebug, error as logError, warn } from "../utils/logger.js";
+import { Context } from "hono";
+import { homedir, platform } from "node:os";
+import { writeFileSync, mkdirSync, existsSync, chmodSync } from "node:fs";
+import { join } from "node:path";
+import { randomBytes, createHash } from "node:crypto";
+import { info, error as logError } from "../utils/logger.js";
 
 /**
- * Spawned-CLI subscription login using a real pseudo-TTY.
+ * Direct OAuth implementation for Claude.ai subscription sign-in.
  *
- * We use `claude auth login --claudeai` (NOT bare `claude login`) — the
- * `--claudeai` flag selects the Claude subscription provider directly, so
- * the CLI skips its "Select login method" menu entirely. Only the theme
- * picker remains (and only on first ever CLI launch), which our state
- * machine + pre-stuffed Enters auto-confirm.
+ * Instead of spawning the `claude` CLI in a PTY and trying to script its TUI
+ * (which doesn't work on Windows because the CLI uses ESC[?9001h Win32 Input
+ * Mode and reads console events directly, bypassing PTY stdin), this handler
+ * performs the OAuth 2.0 PKCE flow itself:
  *
- * The Claude CLI refuses to render its sign-in flow when stdin isn't a TTY,
- * so we use `node-pty` (ConPTY on Windows / openpty on POSIX) to give it
- * the terminal semantics it expects.
+ *   1. Backend generates code_verifier + code_challenge + state.
+ *   2. Backend builds the same authorize URL the CLI would build and hands
+ *      it to the frontend to open in the user's browser.
+ *   3. User signs in to claude.ai; Anthropic redirects to
+ *      platform.claude.com/oauth/code/callback which displays the code as
+ *      `{auth_code}#{state}`.
+ *   4. User pastes that value back into our modal.
+ *   5. Backend POSTs to /v1/oauth/token with grant_type=authorization_code,
+ *      code_verifier, etc. — same call the CLI makes.
+ *   6. Backend writes the returned tokens to ~/.claude/.credentials.json in
+ *      the exact JSON shape the Claude CLI itself uses, so subsequent CLI
+ *      runs (and our own status check) see the user as authenticated.
+ *
+ * Constants extracted from @anthropic-ai/claude-code 1.0.108 cli.js.
  */
+
+const ANTHROPIC_OAUTH = {
+  CLIENT_ID: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+  AUTHORIZE_URL: "https://claude.com/cai/oauth/authorize",
+  TOKEN_URL: "https://console.anthropic.com/v1/oauth/token",
+  PROFILE_URL: "https://console.anthropic.com/api/oauth/profile",
+  REDIRECT_URI: "https://platform.claude.com/oauth/code/callback",
+  SCOPES: [
+    "org:create_api_key",
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+  ],
+};
 
 type Phase =
   | "idle"
-  | "spawning"
-  | "waiting_url"
   | "browser_opened"
+  | "verifying"
   | "success"
   | "no_subscription"
   | "error"
   | "cancelled";
 
+interface SubscriptionEvent {
+  t: number;
+  msg: string;
+}
+
 interface SubscriptionState {
   phase: Phase;
   url: string | null;
-  urls: string[];
   error: string | null;
+  codeVerifier: string | null;
+  state: string | null;
   startedAt: number | null;
-  process: pty.IPty | null;
-  output: string;
+  events: SubscriptionEvent[];
+  /** Set after a successful sign-in. */
+  subscriptionType: string | null;
 }
-
-const URL_PATTERN =
-  /https:\/\/(?:claude\.com|claude\.ai|console\.anthropic\.com|auth\.anthropic\.com|platform\.claude\.com)\/[^\s]+/;
-
-const SUCCESS_HINTS = [
-  /logged in/i,
-  /login successful/i,
-  /authentication.+success/i,
-  /you'?re signed in/i,
-  /successfully (?:logged|signed)/i,
-  /auth(?:entication)? complete/i,
-  /signed in (?:as|to|with)/i,
-  /welcome to claude/i,
-  /claude code (?:is )?ready/i,
-  /credentials? (?:saved|stored)/i,
-];
-
-// Hints that mean "OAuth worked but this account doesn't have a paid
-// Claude Code plan attached". Different CLI builds phrase this differently,
-// so we keep a broad set.
-const NO_SUBSCRIPTION_HINTS = [
-  /no (?:active )?(?:claude(?:\s*code)?\s*)?subscription/i,
-  /subscription (?:is )?required/i,
-  /(?:upgrade|subscribe) to (?:pro|max|claude)/i,
-  /claude code (?:is )?not (?:available|enabled) on (?:this|your) (?:plan|account)/i,
-  /does(?:n'?t| not) have (?:an? )?(?:active )?(?:claude(?:\s*code)?\s*)?(?:subscription|plan)/i,
-  /free (?:tier|plan).*(?:not|cannot|doesn'?t)/i,
-  /please subscribe/i,
-];
-
-// Patterns that identify which screen the CLI is showing. Theme picker has
-// varied across CLI versions — older builds say "Choose your theme" with
-// dark/light/daltonized options; newer builds show "Syntax theme: Monokai
-// Extended (ctrl+t to disable)" with a live code preview. Be lenient.
-const THEME_MENU_PATTERN =
-  /(syntax theme|monokai extended|ctrl\+t to disable|choose.*(theme|text style|appearance)|select.*theme|color theme|terminal appearance|dark mode|light mode|daltonized)/i;
-const LOGIN_METHOD_PATTERN =
-  /(select login method|claude account with subscription|anthropic console account|3rd-party platform)/i;
-// Anything that proves the CLI has actually started rendering output.
-const CLI_READY_PATTERN = /welcome to|claude code v?\d+\.\d+/i;
-
-type MenuStep = "theme" | "login_method" | "url";
 
 let current: SubscriptionState = {
   phase: "idle",
   url: null,
-  urls: [],
   error: null,
+  codeVerifier: null,
+  state: null,
   startedAt: null,
-  process: null,
-  output: "",
+  events: [],
+  subscriptionType: null,
 };
 
 function reset(): void {
   current = {
     phase: "idle",
     url: null,
-    urls: [],
     error: null,
+    codeVerifier: null,
+    state: null,
     startedAt: null,
-    process: null,
-    output: "",
+    events: [],
+    subscriptionType: null,
   };
 }
 
-function isTerminal(phase: Phase): boolean {
-  return (
-    phase === "idle" ||
-    phase === "success" ||
-    phase === "no_subscription" ||
-    phase === "error" ||
-    phase === "cancelled"
-  );
-}
-
-function createNoBrowserEnv(): Record<string, string> {
-  const extra: Record<string, string> = {
-    BROWSER: "none",
-    DISPLAY: "",
-    // Do NOT set CI=true — it disables the CLI's server-side polling loop
-    // that waits for the OAuth callback to arrive at platform.claude.com.
-  };
-  try {
-    const tmpDir = path.join(os.tmpdir(), "aiide-nobrowser");
-    fs.mkdirSync(tmpDir, { recursive: true });
-    if (process.platform === "win32") {
-      const stub = path.join(tmpDir, "start.cmd");
-      if (!fs.existsSync(stub)) {
-        fs.writeFileSync(stub, "@echo off\r\nexit /b 0\r\n", "utf8");
-      }
-      extra.PATH = `${tmpDir};${process.env.PATH ?? ""}`;
-      extra.BROWSER = stub;
-    } else {
-      const stub = path.join(tmpDir, "noop-browser");
-      if (!fs.existsSync(stub)) {
-        fs.writeFileSync(stub, "#!/bin/sh\nexit 0\n", "utf8");
-        fs.chmodSync(stub, 0o755);
-      }
-      extra.PATH = `${tmpDir}:${process.env.PATH ?? ""}`;
-      extra.BROWSER = stub;
-    }
-  } catch (err) {
-    warn(`createNoBrowserEnv: stub write failed (${err instanceof Error ? err.message : err}), env-only fallback active.`);
-  }
-  return extra;
-}
-
-/**
- * Post-login probe via `claude auth status --json`. Non-billable, no model
- * call — just inspects the local credentials store. If the JSON reports no
- * active subscription (free tier / no plan / Console API key only), we flip
- * shared state to `no_subscription` so the UI can show the upgrade prompt.
- *
- * Other failures (binary missing, timeout, malformed JSON) are swallowed —
- * we'll discover the problem naturally when the user actually chats.
- */
-async function verifySubscriptionUsable(): Promise<void> {
-  const claudePath = process.env.CLAUDE_PATH;
-  if (!claudePath) return;
-  if (current.phase !== "success") return;
-
-  try {
-    const child = pty.spawn(
-      claudePath,
-      ["auth", "status", "--json"],
-      {
-        name: "xterm-256color",
-        cols: 120,
-        rows: 30,
-        cwd: process.cwd(),
-        env: { ...process.env } as Record<string, string>,
-      }
-    );
-    let buf = "";
-    child.onData((d: string) => {
-      buf += d;
-    });
-    const exitCode: number = await new Promise((resolve) => {
-      const killTimer = setTimeout(() => {
-        try {
-          child.kill();
-        } catch {
-          /* ignore */
-        }
-        resolve(-1);
-      }, 10_000);
-      child.onExit(({ exitCode: code }) => {
-        clearTimeout(killTimer);
-        resolve(code);
-      });
-    });
-
-    const plain = stripAnsi(buf);
-    logDebug(`auth status raw output (exit ${exitCode}): ${plain.slice(0, 500)}`);
-
-    // Try to parse JSON — CLI may wrap it in extra whitespace / ANSI noise.
-    const jsonMatch = plain.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      logDebug("auth status: no JSON object found in output, skipping verify.");
-      return;
-    }
-
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
-    } catch {
-      logDebug("auth status: JSON parse failed, skipping verify.");
-      return;
-    }
-
-    // Look at a few candidate fields the CLI might use. The exact schema
-    // varies by CLI version — we accept any of these as a "has subscription"
-    // signal: a non-empty subscription/plan/tier field that isn't "free".
-    const blob = JSON.stringify(parsed).toLowerCase();
-    const looksFree = /"(subscription|plan|tier|account_?type)"\s*:\s*("?(free|none|null|inactive)"?|null)/.test(
-      blob
-    );
-    const hasPaidMarker = /"(pro|max|team|enterprise|active|claudeai|subscribed)"/.test(
-      blob
-    );
-    const explicitNoSub = /"(has_?subscription|subscription_?active)"\s*:\s*false/.test(
-      blob
-    );
-
-    if ((looksFree || explicitNoSub) && !hasPaidMarker && current.phase === "success") {
-      current.phase = "no_subscription";
-      current.error =
-        "Sign-in succeeded, but this account doesn't have an active Claude Code subscription yet.";
-      current.output = plain.slice(-2000);
-      info("auth status probe: account has no active Claude Code plan.");
-    } else {
-      logDebug("auth status probe: subscription looks active.");
-    }
-  } catch (err) {
-    logDebug(
-      `auth status probe skipped: ${err instanceof Error ? err.message : err}`
-    );
+const MAX_EVENTS = 200;
+function step(msg: string): void {
+  info(msg);
+  current.events.push({ t: Date.now(), msg });
+  if (current.events.length > MAX_EVENTS) {
+    current.events.splice(0, current.events.length - MAX_EVENTS);
   }
 }
 
-function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\[[0-9;?]*[ -/]*[@-~]/g, "");
+function setPhase(next: Phase, reason: string): void {
+  if (current.phase === next) return;
+  step(`[claude login] phase ${current.phase} → ${next} (${reason})`);
+  current.phase = next;
+}
+
+function base64Url(buf: Buffer): string {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+function generatePkce(): { verifier: string; challenge: string } {
+  const verifier = base64Url(randomBytes(32));
+  const challenge = base64Url(createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+function generateState(): string {
+  return base64Url(randomBytes(32));
+}
+
+function buildAuthorizeUrl(challenge: string, state: string): string {
+  const url = new URL(ANTHROPIC_OAUTH.AUTHORIZE_URL);
+  url.searchParams.append("code", "true");
+  url.searchParams.append("client_id", ANTHROPIC_OAUTH.CLIENT_ID);
+  url.searchParams.append("response_type", "code");
+  url.searchParams.append("redirect_uri", ANTHROPIC_OAUTH.REDIRECT_URI);
+  url.searchParams.append("scope", ANTHROPIC_OAUTH.SCOPES.join(" "));
+  url.searchParams.append("code_challenge", challenge);
+  url.searchParams.append("code_challenge_method", "S256");
+  url.searchParams.append("state", state);
+  return url.toString();
+}
+
+function maskToken(s: string | null | undefined): string {
+  if (!s) return "<none>";
+  if (s.length <= 12) return `${s.slice(0, 2)}…${s.slice(-2)}`;
+  return `${s.slice(0, 6)}…${s.slice(-4)}`;
 }
 
 export async function handleStartSubscription(c: Context) {
-  if (!isTerminal(current.phase)) {
+  step(`[claude login] === START requested === (current phase: ${current.phase})`);
+
+  if (current.phase === "browser_opened" || current.phase === "verifying") {
+    step(`[claude login] Reusing in-flight session — phase=${current.phase}.`);
     return c.json({
       phase: current.phase,
       url: current.url,
-      urls: current.urls,
+      urls: current.url ? [current.url] : [],
       error: current.error,
-      output: current.output,
+      events: current.events,
     });
   }
 
-  const claudePath = process.env.CLAUDE_PATH;
-  if (!claudePath) {
+  reset();
+  const { verifier, challenge } = generatePkce();
+  const state = generateState();
+  current.codeVerifier = verifier;
+  current.state = state;
+  current.url = buildAuthorizeUrl(challenge, state);
+  current.startedAt = Date.now();
+  setPhase("browser_opened", "oauth params generated");
+  step(`[claude login] OAuth URL generated (PKCE challenge_method=S256, state=${state.slice(0, 8)}…). User should open URL → sign in → paste {code}#{state}.`);
+
+  return c.json({
+    phase: current.phase,
+    url: current.url,
+    urls: [current.url],
+    error: current.error,
+    events: current.events,
+  });
+}
+
+export async function handleSubscriptionStatus(c: Context) {
+  const sinceParam = c.req.query("since");
+  const since = sinceParam ? Number(sinceParam) : 0;
+  const events = since > 0
+    ? current.events.filter((e) => e.t > since)
+    : current.events;
+  return c.json({
+    phase: current.phase,
+    url: current.url,
+    urls: current.url ? [current.url] : [],
+    error: current.error,
+    events,
+    subscriptionType: current.subscriptionType,
+  });
+}
+
+export async function handleSubmitSubscriptionCode(c: Context) {
+  const body = await c.req.json<{ code?: string }>();
+  const rawCode = (body.code ?? "").trim();
+  step(`[claude login] === SUBMIT-CODE === phase=${current.phase} codeLen=${rawCode.length}`);
+
+  if (!current.codeVerifier || !current.state) {
+    return c.json(
+      { ok: false, status: "error", error: "No active sign-in session. Click Start sign-in to begin." },
+      400
+    );
+  }
+
+  if (!rawCode) {
+    return c.json(
+      { ok: false, status: "error", error: "Paste the code from the Claude page first." },
+      400
+    );
+  }
+
+  // Reject obvious mistakes — user pasted the OAuth URL params verbatim.
+  if (rawCode === current.state) {
+    return c.json(
+      { ok: false, status: "error", error: "That's the OAuth state, not the authorization code. Copy the code shown on the Claude sign-in page." },
+      400
+    );
+  }
+
+  // Parse {auth_code}#{state} format produced by platform.claude.com.
+  let authCode = rawCode;
+  let pastedState = "";
+  const hashIdx = rawCode.indexOf("#");
+  if (hashIdx > 0) {
+    authCode = rawCode.slice(0, hashIdx);
+    pastedState = rawCode.slice(hashIdx + 1);
+  }
+
+  if (pastedState && pastedState !== current.state) {
+    step(`[claude login] State mismatch — session state=${current.state.slice(0, 8)}…, pasted state=${pastedState.slice(0, 8)}…`);
     return c.json(
       {
-        phase: "error" satisfies Phase,
-        url: null,
-        urls: [],
-        error: "Claude CLI not detected on the backend.",
-        output: "",
+        ok: false,
+        status: "error",
+        error: "The pasted code is from a different sign-in attempt. Click Start sign-in again to get a fresh URL.",
       },
       400
     );
   }
 
-  reset();
-  current.phase = "spawning";
-  current.startedAt = Date.now();
-  info("Spawning `claude auth login --claudeai` inside a PTY…");
+  setPhase("verifying", "exchanging authorization code for tokens");
 
-  let outputBuf = "";
-  let urlHandled = false;
-  let menuStep: MenuStep = "theme";
-  let lastEnterAt = 0;
-  let pressedForTheme = false;
-  let pressedForLogin = false;
-  let cliReadyAt: number | null = null;
-  let lastDataAt = Date.now();
-  let proc: pty.IPty;
-
+  // Step 1: exchange code for tokens.
+  let tokens: {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    scope?: string;
+  };
   try {
-    proc = pty.spawn(claudePath, ["auth", "login", "--claudeai"], {
-      name: "xterm-256color",
-      cols: 100,
-      rows: 30,
-      cwd: process.cwd(),
-      env: { ...process.env, ...createNoBrowserEnv() } as Record<string, string>,
+    step(`[claude login] POST ${ANTHROPIC_OAUTH.TOKEN_URL} (grant_type=authorization_code)`);
+    const res = await fetch(ANTHROPIC_OAUTH.TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        code: authCode,
+        redirect_uri: ANTHROPIC_OAUTH.REDIRECT_URI,
+        client_id: ANTHROPIC_OAUTH.CLIENT_ID,
+        code_verifier: current.codeVerifier,
+        state: current.state,
+      }),
     });
+    step(`[claude login] Token endpoint responded: HTTP ${res.status} ${res.statusText}`);
+
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = await res.text();
+      } catch {
+        /* swallow */
+      }
+      const errMsg =
+        res.status === 401
+          ? "The authorization code is invalid or expired. Get a fresh code from the Claude sign-in page and try again."
+          : `Token exchange failed (HTTP ${res.status}). ${detail.slice(0, 200)}`;
+      setPhase("browser_opened", "token exchange rejected, awaiting retry");
+      current.error = errMsg;
+      step(`[claude login] Token exchange FAILED: ${errMsg}`);
+      return c.json({ ok: false, status: "error", error: errMsg }, 400);
+    }
+
+    tokens = (await res.json()) as typeof tokens;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logError("pty.spawn failed:", msg);
-    current.phase = "error";
-    current.error = `Could not spawn PTY for claude login: ${msg}`;
-    return c.json(
-      {
-        phase: current.phase,
-        url: null,
-        error: current.error,
-        output: "",
+    setPhase("error", "token endpoint unreachable");
+    current.error = `Couldn't reach the Anthropic token endpoint: ${msg}`;
+    logError("[claude login] fetch token failed:", msg);
+    return c.json({ ok: false, status: "error", error: current.error }, 502);
+  }
+
+  const { access_token, refresh_token, expires_in, scope } = tokens;
+  if (!access_token) {
+    setPhase("error", "no access_token in response");
+    current.error = "Anthropic's response didn't include an access_token.";
+    return c.json({ ok: false, status: "error", error: current.error }, 502);
+  }
+  step(`[claude login] Tokens received: access=${maskToken(access_token)}, refresh=${maskToken(refresh_token ?? null)}, expires_in=${expires_in ?? "<none>"}s.`);
+
+  const expiresAt = Date.now() + (expires_in ?? 3600) * 1000;
+  const scopes =
+    typeof scope === "string" && scope.length > 0
+      ? scope.split(/\s+/).filter(Boolean)
+      : ANTHROPIC_OAUTH.SCOPES.slice();
+
+  // Step 2: fetch profile to determine subscription tier. Best-effort and
+  // NEVER blocks sign-in — if Anthropic returns an unrecognized shape (e.g.
+  // newer fields, different field names for Claude.ai Max accounts) we just
+  // save credentials with subscriptionType=null and trust the token. The
+  // real validation happens at chat-time when the API rejects unpaid keys.
+  let subscriptionType: string | null = null;
+  try {
+    step(`[claude login] GET ${ANTHROPIC_OAUTH.PROFILE_URL} to determine subscription tier…`);
+    const profRes = await fetch(ANTHROPIC_OAUTH.PROFILE_URL, {
+      headers: {
+        Authorization: `Bearer ${access_token}`,
+        "Content-Type": "application/json",
       },
-      500
-    );
+    });
+    if (profRes.ok) {
+      const profile = (await profRes.json()) as Record<string, unknown>;
+      step(`[claude login] Profile response: ${JSON.stringify(profile).slice(0, 800)}`);
+      subscriptionType = inferSubscriptionType(profile);
+      step(`[claude login] Inferred subscriptionType=${subscriptionType ?? "<unknown — credentials saved anyway>"}`);
+    } else {
+      const body = await profRes.text().catch(() => "");
+      step(`[claude login] Profile fetch returned HTTP ${profRes.status}. Body: ${body.slice(0, 200)}`);
+    }
+  } catch (err) {
+    step(`[claude login] Profile fetch failed (continuing): ${err instanceof Error ? err.message : err}`);
   }
 
-  current.process = proc;
-  current.phase = "waiting_url";
-
-  const captureOutput = (): void => {
-    current.output = stripAnsi(outputBuf).slice(-2000);
-  };
-
-  const tryExtractUrl = (): void => {
-    const plain = stripAnsi(outputBuf);
-    const urlRe = /https:\/\/(?:claude\.com|claude\.ai|console\.anthropic\.com|auth\.anthropic\.com|platform\.claude\.com)\/[^\s\r\n)>\]"]+/g;
-    const matches = [...plain.matchAll(urlRe)];
-    if (matches.length === 0) return;
-    const allUrls = [...new Set(matches.map((m) => m[0].replace(/[)\].,]+$/, "")))];
-    if (allUrls.length === current.urls.length) return;
-    current.urls = allUrls;
-    // Last URL is typically the "direct key" URL the user wants
-    current.url = allUrls[allUrls.length - 1];
-    if (!urlHandled) {
-      urlHandled = true;
-      current.phase = "browser_opened";
-      logDebug(`OAuth URLs detected (${allUrls.length}): ${allUrls.join(" | ")}`);
+  // Step 3: write credentials.json in the exact shape the Claude CLI uses,
+  // so future CLI runs and our own status check both detect us as signed in.
+  try {
+    const claudeDir = join(homedir(), ".claude");
+    if (!existsSync(claudeDir)) {
+      mkdirSync(claudeDir, { recursive: true });
     }
-  };
-
-  const checkSuccessText = (): void => {
-    if (current.phase === "success" || current.phase === "no_subscription") return;
-    const plain = stripAnsi(outputBuf);
-    if (NO_SUBSCRIPTION_HINTS.some((re) => re.test(plain))) {
-      current.phase = "no_subscription";
-      current.error =
-        "Sign-in succeeded, but this account doesn't have an active Claude Code subscription yet.";
-      return;
-    }
-    if (SUCCESS_HINTS.some((re) => re.test(plain))) {
-      current.phase = "success";
-    }
-  };
-
-  const sawNoSubscriptionHint = (): boolean => {
-    const plain = stripAnsi(outputBuf);
-    return NO_SUBSCRIPTION_HINTS.some((re) => re.test(plain));
-  };
-
-  // Send Enter, but never faster than ~350ms apart — back-to-back writes
-  // can be swallowed by the CLI while it's redrawing the next screen.
-  // We use info() so the line is visible without the DEBUG env var — this
-  // is critical for diagnosing menu detection failures in the field.
-  const pressEnter = (note: string): void => {
-    const now = Date.now();
-    if (now - lastEnterAt < 350) return;
-    lastEnterAt = now;
-    try {
-      proc.write("\r");
-      info(`[claude login] Enter sent: ${note}`);
-    } catch {
-      /* ignore */
-    }
-  };
-
-  // Single funnel for "advance past the login-method menu". Both the
-  // pattern-detection path and the time-based fallback call this — whichever
-  // fires first wins, and the flag prevents a duplicate press.
-  const advanceLogin = (reason: string): void => {
-    if (pressedForLogin || urlHandled || menuStep === "url") return;
-    pressedForLogin = true;
-    menuStep = "url";
-    pressEnter(`confirm Subscription [${reason}]`);
-  };
-
-  const driveMenus = (): void => {
-    if (urlHandled || menuStep === "url") return;
-    const plain = stripAnsi(outputBuf);
-
-    if (menuStep === "theme") {
-      // Skip-theme path: login menu showing first (theme already chosen).
-      if (LOGIN_METHOD_PATTERN.test(plain)) {
-        menuStep = "login_method";
-      } else if (THEME_MENU_PATTERN.test(plain) && !pressedForTheme) {
-        pressedForTheme = true;
-        pressEnter("confirm theme (first highlighted)");
-        menuStep = "login_method";
-        // Time-based fallback: even if LOGIN_METHOD_PATTERN never matches
-        // (CLI text drifted), still advance after a fixed delay. The CLI
-        // typically renders the auth menu within 300-500ms of confirming
-        // the theme, so 700ms is a safe upper bound.
-        setTimeout(() => advanceLogin("post-theme timer"), 700);
-      }
-    }
-
-    if (menuStep === "login_method" && LOGIN_METHOD_PATTERN.test(plain)) {
-      advanceLogin("pattern match");
-    }
-  };
-
-  // Once the CLI prints something substantive, start watching for idle
-  // periods. An "idle" window (no new data for ~900ms) after a screen
-  // change usually means the CLI is waiting for input — that's our cue
-  // to nudge if pattern detection missed.
-  const checkCliReady = (): void => {
-    if (cliReadyAt !== null) return;
-    const plain = stripAnsi(outputBuf);
-    if (CLI_READY_PATTERN.test(plain) || plain.trim().length > 200) {
-      cliReadyAt = Date.now();
-      logDebug("CLI ready signal detected, starting idle-nudge watcher");
-      scheduleIdleNudge();
-    }
-  };
-
-  const scheduleIdleNudge = (): void => {
-    const check = (): void => {
-      if (current.process !== proc) return;
-      if (urlHandled || menuStep === "url") return;
-
-      const idleFor = Date.now() - lastDataAt;
-      if (idleFor < 900) {
-        // CLI still actively rendering; check again shortly.
-        setTimeout(check, 300);
-        return;
-      }
-      // CLI has been quiet for ~900ms — it's waiting for input.
-      if (!pressedForTheme) {
-        pressedForTheme = true;
-        pressEnter("idle-nudge: theme menu");
-        menuStep = "login_method";
-        setTimeout(check, 800); // Keep watching for the login screen
-      } else if (!pressedForLogin) {
-        advanceLogin("idle-nudge: login menu");
-      }
+    const credPath = join(claudeDir, ".credentials.json");
+    const payload = {
+      claudeAiOauth: {
+        accessToken: access_token,
+        refreshToken: refresh_token ?? null,
+        expiresAt,
+        scopes,
+        subscriptionType,
+      },
     };
-    setTimeout(check, 900);
+    writeFileSync(credPath, JSON.stringify(payload), { encoding: "utf-8" });
+    if (platform() !== "win32") {
+      try {
+        chmodSync(credPath, 0o600);
+      } catch {
+        /* best-effort */
+      }
+    }
+    step(`[claude login] Credentials saved to ${credPath}.`);
+    current.subscriptionType = subscriptionType;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    setPhase("error", "credentials write failed");
+    current.error = `Couldn't write credentials file: ${msg}`;
+    logError("[claude login] write creds failed:", msg);
+    return c.json({ ok: false, status: "error", error: current.error }, 500);
+  }
+
+  // Clear PKCE secrets — they've been used and shouldn't sit in memory.
+  current.codeVerifier = null;
+  current.state = null;
+
+  // Always succeed if the token exchange worked. The CLI itself writes
+  // credentials regardless of subscriptionType — the gate is at API-call
+  // time. We do the same.
+  setPhase("success", `sign-in completed (subscriptionType=${subscriptionType ?? "unknown"})`);
+  return c.json({ ok: true, status: "submitted" });
+}
+
+/**
+ * Walk the profile response looking for any signal that this account has a
+ * paid Claude plan. We accept several known field locations and normalised
+ * values because Anthropic's profile schema differs between the Console (API
+ * developer) and Claude.ai (subscription) sides, and across CLI versions:
+ *
+ *   - { organization: { organization_type: "claude_max" } }    ← classic Console shape
+ *   - { account: { type: "max" } }                              ← Claude.ai variant
+ *   - { subscription: { plan: "pro" } }                         ← possible newer shape
+ *   - { plan: "max" }                                            ← flat fallback
+ */
+function inferSubscriptionType(profile: Record<string, unknown>): string | null {
+  const normalise = (raw: unknown): string | null => {
+    if (typeof raw !== "string") return null;
+    const v = raw.toLowerCase().trim();
+    if (!v || v === "free" || v === "none" || v === "null") return null;
+    if (v.includes("max")) return "max";
+    if (v.includes("pro")) return "pro";
+    if (v.includes("enterprise")) return "enterprise";
+    if (v.includes("team")) return "team";
+    return v;
   };
 
-  proc.onData((data: string) => {
-    outputBuf += data;
-    lastDataAt = Date.now();
-    // Always log PTY output after URL is captured so we can see the code-entry prompt
-    if (urlHandled || process.env.DEBUG) {
-      logDebug(`[pty] ${stripAnsi(data).replace(/\r?\n/g, "⏎").slice(0, 200)}`);
-    }
-    tryExtractUrl();
-    checkSuccessText();
-    driveMenus();
-    checkCliReady();
-    captureOutput();
-  });
-
-  // Absolute last-resort nudge: if the CLI hasn't even printed a "welcome"
-  // marker by 8 seconds, send a blind Enter pair anyway. This covers really
-  // exotic CLI builds that print nothing recognisable.
-  setTimeout(() => {
-    if (current.process !== proc || urlHandled) return;
-    if (cliReadyAt !== null) return; // idle-nudge is handling it
-    if (!pressedForTheme) {
-      pressedForTheme = true;
-      pressEnter("last-resort: blind theme");
-      setTimeout(() => advanceLogin("last-resort: blind login"), 700);
-    }
-  }, 8000);
-
-  // ------------------------------------------------------------------
-  // PRE-STUFF stdin: bypass mechanism that doesn't depend on parsing the
-  // CLI's output at all. We queue Enter keystrokes into the PTY at fixed
-  // times after spawn — the CLI's stdin buffer holds them, and as each
-  // interactive menu becomes ready the CLI consumes one Enter (selecting
-  // the highlighted default). This is what gets us through both the theme
-  // and login-method menus regardless of CLI version text drift.
-  //
-  // The state-machine logic above still runs and short-circuits these if
-  // it gets there first — pre-stuff is the safety net, not the primary
-  // path. Once an OAuth URL is seen we stop queueing keystrokes so we
-  // don't accidentally confirm a later prompt.
-  // ------------------------------------------------------------------
-  const PRE_STUFF_DELAYS_MS = [300, 1100, 1900];
-  for (const delay of PRE_STUFF_DELAYS_MS) {
-    setTimeout(() => {
-      if (current.process !== proc) return;
-      if (urlHandled || menuStep === "url") return;
-      try {
-        proc.write("\r");
-        info(`[claude login] Pre-stuff Enter (t=${delay}ms)`);
-        lastEnterAt = Date.now();
-      } catch {
-        /* ignore */
+  const get = (path: string[]): unknown =>
+    path.reduce<unknown>((acc, k) => {
+      if (acc && typeof acc === "object" && k in (acc as Record<string, unknown>)) {
+        return (acc as Record<string, unknown>)[k];
       }
-    }, delay);
+      return undefined;
+    }, profile);
+
+  const candidates: unknown[] = [
+    get(["organization", "organization_type"]),
+    get(["organization", "type"]),
+    get(["organization", "plan"]),
+    get(["organization", "subscription", "type"]),
+    get(["organization", "subscription", "plan"]),
+    get(["account", "type"]),
+    get(["account", "plan"]),
+    get(["account", "subscription", "type"]),
+    get(["account", "subscription", "plan"]),
+    get(["subscription", "type"]),
+    get(["subscription", "plan"]),
+    get(["plan"]),
+    get(["tier"]),
+    get(["account_type"]),
+  ];
+
+  for (const c of candidates) {
+    const norm = normalise(c);
+    if (norm) return norm;
   }
-
-  proc.onExit(({ exitCode, signal }) => {
-    captureOutput();
-    if (current.process !== proc) return;
-    current.process = null;
-
-    // Preserve cancelled / error / no_subscription states already set.
-    if (
-      current.phase === "cancelled" ||
-      current.phase === "error" ||
-      current.phase === "no_subscription"
-    ) {
-      return;
-    }
-
-    // Even on exit code 0, do one last scan — some CLI builds print the
-    // "no subscription" notice and then exit cleanly.
-    if (sawNoSubscriptionHint()) {
-      current.phase = "no_subscription";
-      current.error =
-        "Sign-in succeeded, but this account doesn't have an active Claude Code subscription yet.";
-      info("Claude login completed but no active subscription detected.");
-      return;
-    }
-
-    if (exitCode === 0) {
-      current.phase = "success";
-      info("Claude login succeeded.");
-      // Verify subscription is actually usable in the background; if not,
-      // flip phase to no_subscription so the UI can warn the user.
-      void verifySubscriptionUsable();
-      return;
-    }
-
-    current.phase = "error";
-    const tail = stripAnsi(outputBuf).trim().slice(-500);
-    current.error =
-      `claude login exited with code ${exitCode}${signal ? ` (signal ${signal})` : ""}.` +
-      (tail ? `\nLast output:\n${tail}` : " (no output captured)");
-    warn(current.error);
-  });
-
-  // Hard 5-minute timeout — user needs time to sign in.
-  setTimeout(
-    () => {
-      if (current.phase === "browser_opened" || current.phase === "waiting_url") {
-        captureOutput();
-        const tail = stripAnsi(outputBuf).trim().slice(-500);
-        current.phase = "error";
-        current.error =
-          `Timed out after 5 minutes waiting for sign-in.` +
-          (tail ? `\nLast CLI output:\n${tail}` : "");
-        if (current.process && current.process === proc) {
-          try {
-            proc.kill();
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-    },
-    5 * 60 * 1000
-  );
-
-  return c.json({
-    phase: current.phase,
-    url: current.url,
-    urls: current.urls,
-    error: current.error,
-    output: current.output,
-  });
-}
-
-export async function handleSubscriptionStatus(c: Context) {
-  return c.json({
-    phase: current.phase,
-    url: current.url,
-    urls: current.urls,
-    error: current.error,
-    output: current.output,
-  });
-}
-
-export async function handleSubmitSubscriptionCode(c: Context) {
-  const body = await c.req.json<{ code: string }>();
-  const rawCode = (body.code ?? "").trim();
-  if (!rawCode) {
-    return c.json({ ok: false, error: "No code provided." }, 400);
-  }
-
-  // Strategy A — if the user pasted the full redirect URL (e.g. the browser's
-  // address bar after auth failed to redirect), fetch it directly so the
-  // CLI's local callback server handles it.
-  if (rawCode.startsWith("http://") || rawCode.startsWith("https://")) {
-    try {
-      await fetch(rawCode, { signal: AbortSignal.timeout(6_000) });
-      info("[claude login] Redirect URL fetched by submit-code endpoint.");
-      return c.json({ ok: true });
-    } catch (err) {
-      info(`[claude login] Redirect URL fetch failed: ${err instanceof Error ? err.message : err}. Falling through to code-only path.`);
-    }
-  }
-
-  // Strategy B — user pasted only the authorization code; reconstruct the
-  // redirect URI from the stored auth URL and hit the CLI's local server.
-  const authUrl = current.urls[0] ?? current.url;
-  if (authUrl) {
-    try {
-      const parsed = new URL(authUrl);
-      const redirectUri = parsed.searchParams.get("redirect_uri");
-      if (redirectUri && redirectUri.startsWith("http://localhost")) {
-        const callbackUrl = new URL(redirectUri);
-        callbackUrl.searchParams.set("code", rawCode);
-        const state = parsed.searchParams.get("state");
-        if (state) callbackUrl.searchParams.set("state", state);
-        await fetch(callbackUrl.toString(), { signal: AbortSignal.timeout(6_000) });
-        info(`[claude login] Callback fetched: ${callbackUrl.toString().slice(0, 80)}`);
-        return c.json({ ok: true });
-      }
-    } catch (err) {
-      info(`[claude login] Callback fetch failed: ${err instanceof Error ? err.message : err}. Trying stdin.`);
-    }
-  }
-
-  // Strategy C — last resort: write code to PTY stdin.
-  if (current.process) {
-    try {
-      current.process.write(rawCode + "\r");
-      info("[claude login] Authorization code written to PTY stdin.");
-      return c.json({ ok: true });
-    } catch (err) {
-      return c.json(
-        { ok: false, error: err instanceof Error ? err.message : "Failed to submit code." },
-        500
-      );
-    }
-  }
-
-  return c.json({ ok: false, error: "No active login session." }, 400);
+  return null;
 }
 
 export async function handleCancelSubscription(c: Context) {
-  if (current.process) {
-    current.phase = "cancelled";
-    try {
-      current.process.kill();
-    } catch {
-      /* ignore */
-    }
-    info("Subscription login cancelled by user.");
-  } else {
-    reset();
-  }
-  return c.json({ ok: true, phase: current.phase });
+  step(`[claude login] === CANCEL requested === (phase: ${current.phase})`);
+  setPhase("cancelled", "user cancelled");
+  reset();
+  return c.json({ ok: true, phase: "cancelled" });
 }
