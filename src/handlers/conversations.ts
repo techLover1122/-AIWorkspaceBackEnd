@@ -21,9 +21,11 @@ export async function handleConversationRequest(c: Context) {
       .filter(Boolean)
       .map((l) => JSON.parse(l));
 
-    const sorted = lines.sort(
-      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-    );
+    // Lines without timestamps (queue-operation, ai-title, …) sort to the
+    // start so they don't shuffle the actual conversation order.
+    const ts = (l: HistoryLine) =>
+      l.timestamp ? new Date(l.timestamp).getTime() : 0;
+    const sorted = lines.sort((a, b) => ts(a) - ts(b));
 
     return c.json({
       sessionId,

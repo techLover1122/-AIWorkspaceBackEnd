@@ -34,8 +34,13 @@ export interface ConversationSummary {
 }
 
 export interface HistoryLine {
-  type: "user" | "assistant" | "system" | "result";
-  message: unknown;
-  timestamp: string;
-  uuid: string;
+  /** "user" | "assistant" | "system" | "result" are the canonical chat types.
+   *  Newer transcripts also include housekeeping lines like "queue-operation",
+   *  "attachment", "file-history-snapshot", "ai-title", "last-prompt" — kept
+   *  open as `string` so we don't have to chase the schema. */
+  type: string;
+  message?: unknown;
+  timestamp?: string;
+  uuid?: string;
+  sessionId?: string;
 }

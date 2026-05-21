@@ -1,5 +1,5 @@
 import { Context } from "hono";
-import { readFile, access, readdir, stat } from "node:fs/promises";
+import { readFile, access, readdir, stat, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProjectInfo } from "../types.js";
@@ -34,6 +34,63 @@ function decodeName(encoded: string): string {
   return encoded;
 }
 
+/**
+ * Pull the authoritative `cwd` from the most recent jsonl in a project dir.
+ * The Claude CLI records the original working directory on most history
+ * lines, which lets us round-trip names like `d--Working-AI-IDE` back to
+ * `d:\Working\AI-IDE` (literal dashes survive — the heuristic decoder
+ * mangles them). Reads only a 16KB head from one file, so it stays cheap.
+ */
+async function findCwdFromHistory(historyDir: string): Promise<string | null> {
+  let files: string[];
+  try {
+    files = (await readdir(historyDir)).filter((f) => f.endsWith(".jsonl"));
+  } catch {
+    return null;
+  }
+  if (files.length === 0) return null;
+
+  // Pick the most recently modified jsonl — likeliest to reflect the
+  // current cwd if the project moved.
+  let chosen = files[0];
+  let chosenMtime = 0;
+  for (const f of files) {
+    try {
+      const s = await stat(join(historyDir, f));
+      if (s.mtimeMs > chosenMtime) {
+        chosenMtime = s.mtimeMs;
+        chosen = f;
+      }
+    } catch {
+      /* skip */
+    }
+  }
+
+  let fh;
+  try {
+    fh = await open(join(historyDir, chosen), "r");
+    const buf = Buffer.alloc(16 * 1024);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+    const head = buf.toString("utf-8", 0, bytesRead);
+    for (const line of head.split("\n")) {
+      if (!line) continue;
+      // Avoid parsing a truncated last line.
+      if (!line.startsWith("{") || !line.trim().endsWith("}")) continue;
+      try {
+        const obj = JSON.parse(line) as { cwd?: unknown };
+        if (typeof obj.cwd === "string" && obj.cwd.length > 0) return obj.cwd;
+      } catch {
+        /* malformed line — keep scanning */
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
+
 export async function handleProjectsRequest(c: Context) {
   // The source of truth is `~/.claude/projects/<encoded>/*.jsonl`. The CLI
   // creates these dirs whenever a session is recorded, regardless of whether
@@ -44,16 +101,22 @@ export async function handleProjectsRequest(c: Context) {
   // changed.
   const byEncoded = new Map<string, ProjectInfo>();
 
-  // 1. Directory listing (primary source).
+  // 1. Directory listing (primary source). For each project, try to recover
+  //    the original cwd from its jsonl history so we get a precise display
+  //    path; fall back to the lossy heuristic decode if that fails.
   try {
     const entries = await readdir(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      byEncoded.set(entry.name, {
-        path: decodeName(entry.name),
-        encodedName: entry.name,
-      });
-    }
+    const dirs = entries.filter((e) => e.isDirectory());
+    const resolved = await Promise.all(
+      dirs.map(async (e) => {
+        const cwd = await findCwdFromHistory(join(CLAUDE_PROJECTS_DIR, e.name));
+        return {
+          encodedName: e.name,
+          path: cwd ?? decodeName(e.name),
+        };
+      })
+    );
+    for (const info of resolved) byEncoded.set(info.encodedName, info);
   } catch {
     // No projects dir yet — fall through to config-only path below.
   }
