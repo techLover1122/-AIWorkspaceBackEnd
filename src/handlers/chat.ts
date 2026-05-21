@@ -40,7 +40,15 @@ export function abortRequest(requestId: string): boolean {
 
 export async function handleChatRequest(c: Context) {
   const body = (await c.req.json()) as ChatRequest;
-  const { message, sessionId, requestId, allowedTools, workingDirectory, permissionMode } = body;
+  const {
+    message,
+    sessionId,
+    requestId,
+    allowedTools,
+    workingDirectory,
+    permissionMode,
+    attachments,
+  } = body;
 
   // Only use cwd if it actually exists — a missing cwd causes ENOENT on spawn.
   const safeCwd = workingDirectory && existsSync(workingDirectory) ? workingDirectory : undefined;
@@ -135,8 +143,43 @@ export async function handleChatRequest(c: Context) {
           resume: sessionId ?? null,
           isContinue,
         });
+        // When the user sends images, hand them to Claude as proper
+        // multimodal content blocks (base64 image sources). The default
+        // string prompt would only carry the text — Claude would see
+        // filenames like "annotation-12345.png" and try to Read them off
+        // disk, which fails ("File does not exist").
+        const promptInput =
+          attachments && attachments.length > 0
+            ? (async function* () {
+                yield {
+                  type: "user" as const,
+                  parent_tool_use_id: null,
+                  message: {
+                    role: "user" as const,
+                    content: [
+                      { type: "text" as const, text: message },
+                      ...attachments.map((a) => ({
+                        type: "image" as const,
+                        source: {
+                          type: "base64" as const,
+                          media_type: a.mediaType as
+                            | "image/png"
+                            | "image/jpeg"
+                            | "image/gif"
+                            | "image/webp",
+                          data: a.base64,
+                        },
+                      })),
+                    ],
+                  },
+                  // Required field on SDKUserMessage even though we don't
+                  // have a session — the SDK fills this in when streaming.
+                  session_id: sessionId ?? "",
+                };
+              })()
+            : message;
         const response = query({
-          prompt: message,
+          prompt: promptInput,
           options: {
             abortController,
             ...(sessionId ? { resume: sessionId } : {}),
