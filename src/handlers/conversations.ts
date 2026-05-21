@@ -9,6 +9,9 @@ const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
 export async function handleConversationRequest(c: Context) {
   const encodedName = c.req.param("encodedProjectName");
   const sessionId = c.req.param("sessionId");
+  if (!encodedName || !sessionId) {
+    return c.json({ error: "Missing parameters" }, 400);
+  }
   const filePath = join(CLAUDE_PROJECTS_DIR, encodedName, `${sessionId}.jsonl`);
 
   try {

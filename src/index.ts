@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
 import { info } from "./utils/logger.js";
@@ -8,7 +9,6 @@ const host = process.env.HOST ?? "127.0.0.1";
 const debug = process.env.DEBUG === "true";
 
 async function main() {
-  // Detect Claude CLI once at startup (writes to CLAUDE_PATH for handlers).
   const detected = await warmStartClaudeCli(process.env.CLAUDE_PATH);
   if (detected) {
     process.env.CLAUDE_PATH = detected;

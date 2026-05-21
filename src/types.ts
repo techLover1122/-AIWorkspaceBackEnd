@@ -6,7 +6,7 @@ export interface AppConfig {
 }
 
 export interface StreamResponse {
-  type: "claude_json" | "error" | "done" | "aborted";
+  type: "claude_json" | "error" | "done" | "aborted" | "permission_request";
   data?: unknown;
   error?: string;
 }
@@ -17,7 +17,7 @@ export interface ChatRequest {
   requestId: string;
   allowedTools?: string[];
   workingDirectory?: string;
-  permissionMode?: "default" | "plan" | "acceptEdits";
+  permissionMode?: "default" | "plan" | "acceptEdits" | "bypassPermissions";
 }
 
 export interface ProjectInfo {

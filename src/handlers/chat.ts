@@ -1,7 +1,32 @@
 import { Context } from "hono";
-import { query } from "@anthropic-ai/claude-code";
+import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
+import { existsSync } from "node:fs";
 import type { ChatRequest, StreamResponse } from "../types.js";
-import { debug, error as logError } from "../utils/logger.js";
+import { info, warn, error as logError } from "../utils/logger.js";
+import { recordSession } from "../utils/db.js";
+import { createAiideMcpServer } from "../mcp/aiideTools.js";
+import {
+  createPendingPermission,
+  denyPending,
+  type PermissionRequestPayload,
+} from "./permission.js";
+
+// MCP tool names must be prefixed with `mcp__<server>__` in allowedTools.
+const MCP_TOOL_NAMES = [
+  "mcp__aiide__open_tab",
+  "mcp__aiide__add_bookmark",
+  "mcp__aiide__list_bookmarks",
+  "mcp__aiide__delete_bookmark",
+  "mcp__aiide__scan_ports",
+  "mcp__aiide__create_pack",
+];
+
+// Tools whose response path we don't wire through our frontend. Populate as
+// new ones surface. AskUserQuestion now has a custom modal handler in the
+// frontend that intercepts the tool_use block, shows a popup, and sends the
+// user's answer back as a follow-up chat message — so it stays allowed.
+const DISALLOWED_TOOLS: string[] = [
+];
 
 const abortControllers = new Map<string, AbortController>();
 
@@ -17,7 +42,22 @@ export async function handleChatRequest(c: Context) {
   const body = (await c.req.json()) as ChatRequest;
   const { message, sessionId, requestId, allowedTools, workingDirectory, permissionMode } = body;
 
-  debug("Chat request:", { requestId, sessionId, permissionMode, workingDirectory });
+  // Only use cwd if it actually exists — a missing cwd causes ENOENT on spawn.
+  const safeCwd = workingDirectory && existsSync(workingDirectory) ? workingDirectory : undefined;
+  if (workingDirectory && !safeCwd) {
+    warn(`Working directory does not exist, ignoring: ${workingDirectory}`);
+  }
+
+  const isContinue = typeof message === "string" && message.trim() === "continue";
+  info("Chat request:", {
+    requestId,
+    sessionId: sessionId ?? null,
+    isContinue,
+    permissionMode: permissionMode ?? null,
+    workingDirectory: safeCwd ?? null,
+    callerAllowedTools: allowedTools ?? [],
+    messagePreview: typeof message === "string" ? message.slice(0, 120) : null,
+  });
 
   const abortController = new AbortController();
   abortControllers.set(requestId, abortController);
@@ -28,22 +68,181 @@ export async function handleChatRequest(c: Context) {
         controller.enqueue(new TextEncoder().encode(JSON.stringify(data) + "\n"));
       };
 
+      // Track every pending permission we open so we can auto-deny on
+      // stream abort (otherwise the SDK call hangs forever).
+      const openPermissions = new Set<string>();
+
+      // The structured permission callback. Replaces the regex-based
+      // is_error parsing — SDK calls this for any tool that needs approval
+      // and we surface a permission_request stream event with full context.
+      const canUseTool: CanUseTool = async (toolName, input, options) => {
+        const { id, promise } = createPendingPermission({
+          toolUseId: options.toolUseID,
+          toolName,
+          input,
+        });
+        openPermissions.add(id);
+
+        const payload: PermissionRequestPayload = {
+          id,
+          toolUseId: options.toolUseID,
+          toolName,
+          input,
+          title: options.title,
+          displayName: options.displayName,
+          description: options.description,
+          blockedPath: options.blockedPath,
+          decisionReason: options.decisionReason,
+          suggestions: options.suggestions,
+        };
+        info("SDK canUseTool fired:", {
+          requestId,
+          id,
+          toolName,
+          toolUseId: options.toolUseID,
+          blockedPath: options.blockedPath,
+          decisionReason: options.decisionReason,
+          suggestionCount: options.suggestions?.length ?? 0,
+        });
+        send({ type: "permission_request", data: payload });
+
+        // If the SDK signals abort while we're waiting on the user, deny.
+        const onAbort = () => {
+          if (denyPending(id, "Aborted by user")) {
+            openPermissions.delete(id);
+          }
+        };
+        options.signal.addEventListener("abort", onAbort, { once: true });
+        try {
+          const result = await promise;
+          openPermissions.delete(id);
+          return result;
+        } finally {
+          options.signal.removeEventListener("abort", onAbort);
+        }
+      };
+
       try {
         const claudePath = process.env.CLAUDE_PATH;
+        // Always make AI-IDE skills available; merge with any caller-allowed tools.
+        const mergedAllowedTools = [
+          ...MCP_TOOL_NAMES,
+          ...(allowedTools ?? []),
+        ];
+        info("Invoking SDK query:", {
+          requestId,
+          mergedAllowedTools,
+          resume: sessionId ?? null,
+          isContinue,
+        });
         const response = query({
           prompt: message,
           options: {
             abortController,
             ...(sessionId ? { resume: sessionId } : {}),
             ...(claudePath ? { pathToClaudeCodeExecutable: claudePath } : {}),
-            ...(workingDirectory ? { cwd: workingDirectory } : {}),
-            ...(allowedTools?.length ? { allowedTools } : {}),
+            ...(safeCwd ? { cwd: safeCwd } : {}),
+            allowedTools: mergedAllowedTools,
+            disallowedTools: DISALLOWED_TOOLS,
+            mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
+            canUseTool,
             ...(permissionMode ? { permissionMode } : {}),
           },
         });
 
+        let detectedSessionId: string | null = sessionId ?? null;
+        let messageCount = 0;
         for await (const sdkMessage of response) {
           send({ type: "claude_json", data: sdkMessage });
+          const msg = sdkMessage as unknown as {
+            session_id?: string;
+            type?: string;
+            message?: { content?: Array<Record<string, unknown>> };
+          };
+          if (msg.session_id) detectedSessionId = msg.session_id;
+          if (msg.type === "assistant" || msg.type === "user") messageCount++;
+          // Authoritative auto-deny signal from the SDK.
+          if (msg.type === "system") {
+            const sysMsg = sdkMessage as unknown as {
+              subtype?: string;
+              tool_name?: string;
+              tool_use_id?: string;
+              decision_reason?: string;
+              decision_reason_type?: string;
+              message?: string;
+            };
+            if (sysMsg.subtype === "permission_denied") {
+              warn("SDK permission_denied:", {
+                requestId,
+                tool: sysMsg.tool_name,
+                tool_use_id: sysMsg.tool_use_id,
+                reasonType: sysMsg.decision_reason_type,
+                reason: sysMsg.decision_reason,
+                message: sysMsg.message,
+              });
+            }
+          }
+          // Log every tool call + tool result so the backend console shows the
+          // exact SDK signal that lead to a permission UI / error in the chat.
+          const content = msg.message?.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              const t = block.type as string | undefined;
+              if (t === "tool_use") {
+                info("SDK tool_use:", {
+                  requestId,
+                  name: block.name,
+                  id: block.id,
+                  input: block.input,
+                });
+                // Extra-loud log for AskUserQuestion so it's easy to spot in
+                // the backend terminal when debugging the modal flow.
+                if (block.name === "AskUserQuestion") {
+                  const qs =
+                    (block.input as { questions?: Array<{ header?: string; question?: string }> })
+                      ?.questions ?? [];
+                  info("SDK AskUserQuestion detected:", {
+                    requestId,
+                    tool_use_id: block.id,
+                    questionCount: qs.length,
+                    headers: qs.map((q) => q.header),
+                    note: "Frontend modal will intercept; this SDK call will auto-error and be suppressed.",
+                  });
+                }
+              } else if (t === "tool_result") {
+                const isErr = (block.is_error as boolean) ?? false;
+                let txt = "";
+                if (typeof block.content === "string") {
+                  txt = block.content;
+                } else if (Array.isArray(block.content)) {
+                  txt = (block.content as Array<Record<string, unknown>>)
+                    .map((c) => (typeof c === "string" ? c : ((c?.text as string) ?? "")))
+                    .filter(Boolean)
+                    .join("\n");
+                }
+                if (isErr) {
+                  warn("SDK tool_result ERROR:", {
+                    requestId,
+                    tool_use_id: block.tool_use_id,
+                    text: txt.slice(0, 500),
+                    // Dump the full raw block so empty-body denials are
+                    // visible (text/content-shape is hard to infer otherwise).
+                    rawBlock: JSON.stringify(block).slice(0, 2000),
+                  });
+                } else {
+                  info("SDK tool_result ok:", {
+                    requestId,
+                    tool_use_id: block.tool_use_id,
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        // Persist session metadata after stream completes
+        if (detectedSessionId) {
+          try { recordSession(detectedSessionId, safeCwd ?? null, messageCount); } catch { /* ignore */ }
         }
 
         send({ type: "done" });
@@ -57,6 +256,12 @@ export async function handleChatRequest(c: Context) {
         }
       } finally {
         abortControllers.delete(requestId);
+        // Drain any permission prompts that were never answered (otherwise
+        // their pending entries leak across requests).
+        for (const id of openPermissions) {
+          denyPending(id, "Stream ended without a decision");
+        }
+        openPermissions.clear();
         controller.close();
       }
     },
@@ -73,6 +278,7 @@ export async function handleChatRequest(c: Context) {
 
 export async function handleAbortRequest(c: Context) {
   const requestId = c.req.param("requestId");
+  if (!requestId) return c.json({ success: false }, 400);
   const success = abortRequest(requestId);
   return c.json({ success });
 }

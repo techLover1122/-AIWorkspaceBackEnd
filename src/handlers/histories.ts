@@ -23,6 +23,7 @@ function extractSummary(lines: HistoryLine[]): ConversationSummary {
 
 export async function handleHistoriesRequest(c: Context) {
   const encodedName = c.req.param("encodedProjectName");
+  if (!encodedName) return c.json({ conversations: [] });
   const historyDir = join(CLAUDE_PROJECTS_DIR, encodedName);
 
   try {
