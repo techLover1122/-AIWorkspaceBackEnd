@@ -35,10 +35,20 @@ import type { AppConfig } from "./types.js";
 export function createApp(config: AppConfig) {
   const app = new Hono();
 
+  const corsOrigins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    ...(process.env.INSTANCE_IP
+      ? [`http://${process.env.INSTANCE_IP}`, `http://${process.env.INSTANCE_IP}:80`]
+      : []),
+    ...(process.env.PUBLIC_HOSTNAME
+      ? [`http://${process.env.PUBLIC_HOSTNAME}`, `http://${process.env.PUBLIC_HOSTNAME}:80`]
+      : []),
+  ];
   app.use(
     "*",
     cors({
-      origin: ["http://localhost:3000", "http://localhost:3001"],
+      origin: corsOrigins,
       credentials: true,
     })
   );
