@@ -30,6 +30,10 @@ import {
 import { handleEvents } from "./handlers/events.js";
 import { handleInstallPack } from "./handlers/packs.js";
 import { handlePermissionDecision } from "./handlers/permission.js";
+import {
+  handleListServices,
+  handleRegisterService,
+} from "./handlers/services.js";
 import type { AppConfig } from "./types.js";
 
 export function createApp(config: AppConfig) {
@@ -67,6 +71,13 @@ export function createApp(config: AppConfig) {
   app.post("/api/tabs/log", handleLogTab);
   app.get("/api/tabs/history", handleRecentTabs);
   app.get("/api/sessions/history", handleRecentSessions);
+
+  // Service registry — passthrough to the traefik-router on the proxy
+  // EC2. POST /api/services { port, name? } is idempotent and returns
+  // { name, port, url } where url is the public domain URL Traefik will
+  // route to that port within ~5s.
+  app.get("/api/services", handleListServices);
+  app.post("/api/services", handleRegisterService);
 
   // User-curated URLs (new tab page bookmarks)
   app.get("/api/urls", handleListUrls);

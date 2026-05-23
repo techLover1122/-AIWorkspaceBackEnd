@@ -25,12 +25,50 @@ import {
 } from "../utils/db.js";
 import { scanWebPorts } from "../handlers/ports.js";
 import { publishEvent } from "../handlers/events.js";
+import { registerServicePort } from "../handlers/services.js";
 
 function normalizeUrl(raw: string): string {
   let url = raw.trim();
   if (/^\d+$/.test(url)) return `http://localhost:${url}`;
   if (!/^https?:\/\//i.test(url)) return `http://${url}`;
   return url;
+}
+
+/**
+ * If `url` points at a local port (localhost / 127.0.0.1 / the workspace's
+ * own public IP/host on :<port>), register that port as a service via the
+ * proxy router and return the public domain URL. Otherwise return the URL
+ * unchanged. Registration failures fall back silently to the original URL
+ * so external sites and pre-existing public URLs aren't broken.
+ */
+async function toPublicServiceUrl(url: string): Promise<string> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+  if (!/^https?:$/.test(parsed.protocol)) return url;
+  if (!parsed.port) return url;
+
+  // Only register hosts that resolve to this workspace. Anything else
+  // (e.g. example.com:8080) keeps its original URL.
+  const localHosts = new Set([
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "[::1]",
+    process.env.INSTANCE_IP ?? "",
+    process.env.PUBLIC_IP ?? "",
+    process.env.PUBLIC_HOSTNAME ?? "",
+  ]);
+  if (!localHosts.has(parsed.hostname)) return url;
+
+  const port = Number(parsed.port);
+  const svc = await registerServicePort(port);
+  if (!svc) return url;
+  // Preserve the original path/query/hash on the new host.
+  return `${svc.url}${parsed.pathname}${parsed.search}${parsed.hash}`;
 }
 
 function hostOf(url: string): string {
@@ -65,7 +103,10 @@ export const openTabTool = tool(
       .describe("Optional display label for the tab. If omitted, the hostname is used."),
   },
   async ({ url, label }) => {
-    const fullUrl = normalizeUrl(url);
+    // First resolve a bare port / host:port to a full URL, then convert
+    // any local-port URL into its public domain equivalent (auto-
+    // registering the port as a service if it's not already known).
+    const fullUrl = await toPublicServiceUrl(normalizeUrl(url));
     const displayLabel = label && label.trim() ? label.trim() : hostOf(fullUrl);
 
     // Save as bookmark + mark opened in DB so it survives reload.
