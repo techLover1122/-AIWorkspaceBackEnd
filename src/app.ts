@@ -35,20 +35,14 @@ import type { AppConfig } from "./types.js";
 export function createApp(config: AppConfig) {
   const app = new Hono();
 
-  const corsOrigins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    ...(process.env.INSTANCE_IP
-      ? [`http://${process.env.INSTANCE_IP}`, `http://${process.env.INSTANCE_IP}:80`]
-      : []),
-    ...(process.env.PUBLIC_HOSTNAME
-      ? [`http://${process.env.PUBLIC_HOSTNAME}`, `http://${process.env.PUBLIC_HOSTNAME}:80`]
-      : []),
-  ];
+  // Allow any origin. `credentials: true` is incompatible with the
+  // literal "*", so we reflect the request's Origin header back instead —
+  // browsers accept that combo. A null return means "no Origin header /
+  // unknown" so we fall back to "*" for non-credentialed callers.
   app.use(
     "*",
     cors({
-      origin: corsOrigins,
+      origin: (origin: string) => origin ?? "*",
       credentials: true,
     })
   );
