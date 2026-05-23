@@ -37,7 +37,8 @@ function buildProxyContext(): string | null {
   const domain = process.env.PLATFORM_DOMAIN;
   if (!userId || !domain) return null;
 
-  const base = (name: string) => `http://${name}-${userId}.${domain}`;
+  const scheme = (process.env.PLATFORM_PROTOCOL || "http").toLowerCase();
+  const base = (name: string) => `${scheme}://${name}-${userId}.${domain}`;
   return [
     "# Workspace environment",
     "",
