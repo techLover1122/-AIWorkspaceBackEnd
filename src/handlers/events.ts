@@ -12,7 +12,15 @@ import type { Context } from "hono";
 export type ClientEvent =
   | { type: "open_tab"; url: string; label: string }
   | { type: "bookmark_added"; url: string; name: string | null }
-  | { type: "bookmark_deleted"; id: number };
+  | { type: "bookmark_deleted"; id: number }
+  | {
+      type: "pack_installed";
+      name: string;
+      slug: string;
+      description: string;
+      hasInstall: boolean;
+      installedAt: string;
+    };
 
 type Subscriber = (e: ClientEvent) => void;
 

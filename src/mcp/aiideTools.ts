@@ -14,7 +14,7 @@
 
 import { tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -165,6 +165,87 @@ export const registerServiceTool = tool(
         {
           type: "text",
           text: `Registered port ${result.port} as "${result.name}" → ${result.url}. Routing is live within ~5s. Use this URL anywhere the browser fetches the service.`,
+        },
+      ],
+    };
+  }
+);
+
+/**
+ * Read every SKILL.md under ~/.claude/skills/ and return its name +
+ * description from the frontmatter. Used by list_environment_packs so the
+ * model has a deterministic enumeration of what's installed instead of
+ * relying on opaque skill auto-discovery.
+ */
+function readInstalledPacks(): Array<{
+  slug: string;
+  name: string;
+  description: string;
+  path: string;
+}> {
+  const skillsRoot = join(homedir(), ".claude", "skills");
+  if (!existsSync(skillsRoot)) return [];
+
+  const out: Array<{ slug: string; name: string; description: string; path: string }> = [];
+  for (const slug of readdirSync(skillsRoot)) {
+    const dir = join(skillsRoot, slug);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const skillMd = join(dir, "SKILL.md");
+    if (!existsSync(skillMd)) continue;
+
+    let content = "";
+    try {
+      content = readFileSync(skillMd, "utf8");
+    } catch {
+      continue;
+    }
+
+    // Parse frontmatter: --- ... ---
+    const fm = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
+    let name = slug;
+    let description = "(no description in frontmatter)";
+    if (fm) {
+      const nameMatch = fm[1].match(/^name:\s*(.+)$/m);
+      if (nameMatch) name = nameMatch[1].trim().replace(/^["']|["']$/g, "");
+      const descMatch = fm[1].match(/^description:\s*(.+)$/m);
+      if (descMatch) description = descMatch[1].trim().replace(/^["']|["']$/g, "");
+    }
+    out.push({ slug, name, description, path: dir });
+  }
+  return out.sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
+export const listEnvironmentPacksTool = tool(
+  "list_environment_packs",
+  "List every environment pack installed at ~/.claude/skills/, with its name, slug, description, and path. Call this when the user's request is open-ended about tools/libraries (e.g. \"give me a database viewer\") and you'd otherwise pick on your own — packs encode the user's defaults for those cases. If the user explicitly named a tool, just do what they asked; you don't need to consult packs.",
+  {},
+  async () => {
+    const packs = readInstalledPacks();
+    if (packs.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No environment packs installed at ~/.claude/skills/. The user has not pinned any tool/library choices, so you may pick reasonable defaults.",
+          },
+        ],
+      };
+    }
+    const lines = packs.map(
+      (p) =>
+        `- **${p.name}** (${p.slug}) — ${p.description}\n    path: ${p.path}\n    Read its SKILL.md with the Skill tool, or directly with Read.`
+    );
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Installed environment packs (${packs.length}):\n${lines.join(
+            "\n"
+          )}\n\nIf YOU are picking (the user left it open), default to the pack whose description matches. If the user explicitly asked for a specific tool, just do that — don't push the pack's choice.`,
         },
       ],
     };
@@ -448,6 +529,7 @@ export function createAiideMcpServer(opts: { workspaceDir?: string } = {}) {
       openTabTool,
       registerServiceTool,
       listServicesTool,
+      listEnvironmentPacksTool,
       addBookmarkTool,
       listBookmarksTool,
       deleteBookmarkTool,

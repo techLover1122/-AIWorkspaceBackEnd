@@ -18,6 +18,15 @@ import { createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import AdmZip from "adm-zip";
 import { warn } from "../utils/logger.js";
+import { publishEvent } from "./events.js";
+
+function parseSkillDescription(skillMd: string): string {
+  const fmMatch = skillMd.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
+  if (!fmMatch) return "";
+  const descMatch = fmMatch[1].match(/^description:\s*(.+)$/m);
+  if (!descMatch) return "";
+  return descMatch[1].trim().replace(/^["']|["']$/g, "");
+}
 
 type Source = "github" | "zip" | "git";
 
@@ -27,6 +36,7 @@ type SuccessResponse = {
   ok: true;
   name: string;
   slug: string;
+  description: string;
   hasInstall: boolean;
   source: Source;
   installedAt: string;
@@ -335,10 +345,32 @@ export async function handleInstallPack(c: Context): Promise<Response> {
     const hasInstall = await pathExists(join(target, "INSTALL.md"));
     log(hasInstall ? "INSTALL.md detected" : "No INSTALL.md (skipping install prompt)");
 
+    // 7) Re-read the moved SKILL.md to pull the description (used by the
+    // SSE event so any chat path — modal, CLI, API — gets a complete
+    // notification for the AI to act on).
+    let description = parseSkillDescription(skillMdContent);
+    if (!description) {
+      // Re-parse from the now-moved file in case the original was empty.
+      try {
+        const movedSkill = await readFile(join(target, "SKILL.md"), "utf8");
+        description = parseSkillDescription(movedSkill);
+      } catch { /* ignore */ }
+    }
+
+    publishEvent({
+      type: "pack_installed",
+      name,
+      slug,
+      description,
+      hasInstall,
+      installedAt: target,
+    });
+
     const result: SuccessResponse = {
       ok: true,
       name,
       slug,
+      description,
       hasInstall,
       source,
       installedAt: target,
