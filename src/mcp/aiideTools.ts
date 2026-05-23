@@ -25,7 +25,14 @@ import {
 } from "../utils/db.js";
 import { scanWebPorts } from "../handlers/ports.js";
 import { publishEvent } from "../handlers/events.js";
-import { registerServicePort } from "../handlers/services.js";
+import { registerServicePort, type RegisteredService } from "../handlers/services.js";
+
+function routerBaseForList(): string | null {
+  const base = process.env.PROXY_ROUTER_URL;
+  const uid = process.env.USER_ID;
+  if (!base || !uid) return null;
+  return `${base.replace(/\/+$/, "")}/api/services/${uid}`;
+}
 
 function normalizeUrl(raw: string): string {
   let url = raw.trim();
@@ -121,6 +128,93 @@ export const openTabTool = tool(
         { type: "text", text: `Opened ${displayLabel} (${fullUrl}) as a new tab.` },
       ],
     };
+  }
+);
+
+export const registerServiceTool = tool(
+  "register_service",
+  "Register a TCP port in this workspace as a public service. Returns the public domain URL the user's browser can reach. Use this BEFORE writing any code that the browser needs to fetch from a port other than the three defaults (3000=frontend, 8090=api, 8080=ide). Idempotent — calling twice with the same port returns the same URL. If you don't pass `name`, the subdomain becomes `port-<port>`.",
+  {
+    port: z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .describe("TCP port the service listens on inside the workspace."),
+    name: z
+      .string()
+      .optional()
+      .describe(
+        "Optional subdomain segment (lowercase letters, digits, dashes; 1-32 chars). If omitted, defaults to `port-<port>`. Reserved: frontend, api, ide."
+      ),
+  },
+  async ({ port, name }) => {
+    const result = await registerServicePort(port, name);
+    if (!result) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Could not register port ${port} — PROXY_ROUTER_URL or USER_ID is not set in this workspace, or the proxy router is unreachable. The user should check /etc/workspace.env and the workspace logs.`,
+          },
+        ],
+      };
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Registered port ${result.port} as "${result.name}" → ${result.url}. Routing is live within ~5s. Use this URL anywhere the browser fetches the service.`,
+        },
+      ],
+    };
+  }
+);
+
+export const listServicesTool = tool(
+  "list_services",
+  "List all services currently registered for this workspace (the three defaults plus anything previously registered). Returns name, port, and public URL for each. Use this when the user asks what's running, or before registering to check if a port already has a name.",
+  {},
+  async () => {
+    const base = routerBaseForList();
+    if (!base) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Cannot list services — PROXY_ROUTER_URL or USER_ID is not set in this workspace.",
+          },
+        ],
+      };
+    }
+    try {
+      const res = await fetch(base);
+      if (!res.ok) throw new Error(`router returned ${res.status}`);
+      const data = (await res.json()) as { services?: RegisteredService[] };
+      const services = data.services ?? [];
+      if (services.length === 0) {
+        return {
+          content: [{ type: "text", text: "No services registered." }],
+        };
+      }
+      const lines = services.map(
+        (s) => `- ${s.name} (port ${s.port}) → ${s.url}`
+      );
+      return {
+        content: [
+          { type: "text", text: `Registered services:\n${lines.join("\n")}` },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to list services: ${err instanceof Error ? err.message : String(err)}`,
+          },
+        ],
+      };
+    }
   }
 );
 
@@ -352,6 +446,8 @@ export function createAiideMcpServer(opts: { workspaceDir?: string } = {}) {
     version: "1.0.0",
     tools: [
       openTabTool,
+      registerServiceTool,
+      listServicesTool,
       addBookmarkTool,
       listBookmarksTool,
       deleteBookmarkTool,

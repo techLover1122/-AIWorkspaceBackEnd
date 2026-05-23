@@ -14,12 +14,78 @@ import {
 // MCP tool names must be prefixed with `mcp__<server>__` in allowedTools.
 const MCP_TOOL_NAMES = [
   "mcp__aiide__open_tab",
+  "mcp__aiide__register_service",
+  "mcp__aiide__list_services",
   "mcp__aiide__add_bookmark",
   "mcp__aiide__list_bookmarks",
   "mcp__aiide__delete_bookmark",
   "mcp__aiide__scan_ports",
   "mcp__aiide__create_pack",
 ];
+
+/**
+ * Workspace-environment context appended to every chat request's system
+ * prompt. Without this the model treats the box as a normal Linux VM and
+ * writes code with `http://localhost:<port>` URLs — which the user's
+ * browser can't reach, since it's on a different origin (the edge proxy).
+ *
+ * Filled at request time from env so it reflects this specific workspace.
+ */
+function buildProxyContext(): string | null {
+  const userId = process.env.USER_ID;
+  const domain = process.env.PLATFORM_DOMAIN;
+  if (!userId || !domain) return null;
+
+  const base = (name: string) => `http://${name}-${userId}.${domain}`;
+  return [
+    "# Workspace environment",
+    "",
+    "This workspace runs behind an edge proxy + per-user Traefik. Every HTTP",
+    "service exposed here is reachable from the user's browser ONLY through a",
+    "public subdomain — `http://localhost:<port>` URLs are NOT reachable from",
+    "the browser (the user is on a different origin).",
+    "",
+    "## Default service URLs",
+    "",
+    `- Frontend (Next.js, port 3000):  ${base("frontend")}`,
+    `- Backend API (Hono, port 8090):  ${base("api")}`,
+    `- code-server / IDE (port 8080):  ${base("ide")}`,
+    "",
+    "## Adding a new service",
+    "",
+    "When you start any new HTTP service in this workspace (a dev server, an",
+    "API, a Storybook, anything):",
+    "",
+    "1. Bind it to localhost or 0.0.0.0 on any unprivileged port — the port",
+    "   itself doesn't matter.",
+    "2. Register the port using the `register_service` MCP tool, e.g.",
+    "   `register_service(port=5173)`. The tool returns the public URL.",
+    "3. Use that URL — NOT `http://localhost:5173` — wherever the browser",
+    "   needs to reach the service (fetch calls, iframe src, links, etc.).",
+    "",
+    "If you skip step 2, the user's browser will get DNS / CORS errors when",
+    "your code tries to fetch the new service.",
+    "",
+    `## Auto-generated subdomain convention\n\nAny port \`P\` registered without an explicit name becomes\n  \`http://port-P-${userId}.${domain}\`\n`,
+    "## CORS",
+    "",
+    `The browser's origin is \`${base("frontend")}\`. Any backend service`,
+    "that needs to receive cross-origin XHR from the frontend must send",
+    "CORS headers permitting that origin (or `*`). The default backend at",
+    `\`${base("api")}\` already does this.`,
+    "",
+    "## Don't",
+    "",
+    "- Don't hardcode `localhost` or `127.0.0.1` URLs in browser-facing code.",
+    "- Don't write Vite/Webpack dev-server configs that print",
+    "  `http://localhost:<port>` as the dev URL — the user will copy-paste it",
+    "  and get a CORS / DNS error. Either reconfigure them to print the",
+    "  registered public URL, or remind the user of the public URL after",
+    "  registering.",
+    "- Don't try to bind privileged ports (<1024). Port 80 is owned by",
+    "  Traefik; don't fight it.",
+  ].join("\n");
+}
 
 // Tools whose response path we don't wire through our frontend. Populate as
 // new ones surface. AskUserQuestion now has a custom modal handler in the
@@ -178,6 +244,7 @@ export async function handleChatRequest(c: Context) {
                 };
               })()
             : message;
+        const proxyContext = buildProxyContext();
         const response = query({
           prompt: promptInput,
           options: {
@@ -190,6 +257,11 @@ export async function handleChatRequest(c: Context) {
             mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
             canUseTool,
             ...(permissionMode ? { permissionMode } : {}),
+            // Inject workspace-environment context (proxy URLs, port
+            // registration, CORS) so the model writes code that works in
+            // this multi-tenant environment instead of hard-coding
+            // localhost:port URLs the browser can't reach.
+            ...(proxyContext ? { appendSystemPrompt: proxyContext } : {}),
           },
         });
 
