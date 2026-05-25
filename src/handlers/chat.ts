@@ -392,9 +392,35 @@ export async function handleChatRequest(c: Context) {
 
   const stream = new ReadableStream({
     async start(controller) {
+      // `controller.enqueue` throws after the stream is closed (e.g. the
+      // heartbeat interval fires once more between `controller.close()` and
+      // the JS event loop catching up). Swallow that specific case so a
+      // shutdown race doesn't crash the request.
+      let closed = false;
       const send = (data: StreamResponse) => {
-        controller.enqueue(new TextEncoder().encode(JSON.stringify(data) + "\n"));
+        if (closed) return;
+        try {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify(data) + "\n"));
+        } catch {
+          // Stream already closed — nothing more we can do.
+          closed = true;
+        }
       };
+
+      // Heartbeat: emit a tiny `{"type":"heartbeat"}` line every 15s while
+      // the SDK is mid-turn. Reasons:
+      //   1. The model itself can think for 30-90s before emitting any
+      //      content — no bytes flow during that time.
+      //   2. canUseTool blocks on the user clicking Allow/Deny — could be
+      //      minutes of total silence.
+      // Without periodic bytes, Traefik / Cloudflare / nginx kill the
+      // connection at their default idle timeouts (~60s), and the frontend
+      // sees it as a "network error". The heartbeat keeps it alive
+      // indefinitely. The frontend parser silently ignores these lines.
+      const HEARTBEAT_MS = 15_000;
+      const heartbeatTimer = setInterval(() => {
+        send({ type: "heartbeat" });
+      }, HEARTBEAT_MS);
 
       // Track every pending permission we open so we can auto-deny on
       // stream abort (otherwise the SDK call hangs forever).
@@ -628,6 +654,10 @@ export async function handleChatRequest(c: Context) {
           send({ type: "error", error: msg });
         }
       } finally {
+        // Stop the heartbeat BEFORE closing the controller — otherwise a
+        // straggling tick can fire between close() and the timer being
+        // cleared, and call enqueue() on a closed stream.
+        clearInterval(heartbeatTimer);
         abortControllers.delete(requestId);
         // Drain any permission prompts that were never answered (otherwise
         // their pending entries leak across requests).
@@ -635,7 +665,12 @@ export async function handleChatRequest(c: Context) {
           denyPending(id, "Stream ended without a decision");
         }
         openPermissions.clear();
-        controller.close();
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          // Already closed by upstream — nothing to do.
+        }
       }
     },
   });

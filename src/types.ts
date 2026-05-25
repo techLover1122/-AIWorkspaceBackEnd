@@ -6,7 +6,18 @@ export interface AppConfig {
 }
 
 export interface StreamResponse {
-  type: "claude_json" | "error" | "done" | "aborted" | "permission_request";
+  type:
+    | "claude_json"
+    | "error"
+    | "done"
+    | "aborted"
+    | "permission_request"
+    // Emitted every ~15s while the SDK is busy (model thinking) or waiting
+    // on a permission decision. Pure side-effect: keeps the HTTP stream
+    // alive past proxy idle timeouts (Traefik / Cloudflare / nginx all
+    // default to ~60s) so the frontend doesn't see a spurious disconnect.
+    // Frontend's stream parser ignores it.
+    | "heartbeat";
   data?: unknown;
   error?: string;
 }
