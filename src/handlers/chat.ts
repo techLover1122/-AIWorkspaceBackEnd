@@ -200,6 +200,147 @@ function buildProxyContext(): string | null {
   ].join("\n");
 }
 
+/**
+ * Playwright E2E-testing context appended to every chat request's system
+ * prompt. Tells the model that a long-running `ai-ide-playwright` Docker
+ * container is available with Playwright + Chromium + Firefox + WebKit
+ * pre-installed, and how to drive it for tests / browser automation.
+ *
+ * Installed by `scripts/cloud-init.sh` Step 8.
+ */
+function buildPlaywrightContext(): string {
+  return [
+    "# E2E testing with Playwright (Docker)",
+    "",
+    "This workspace has a long-running Docker container named",
+    "`ai-ide-playwright` with Playwright + Chromium + Firefox + WebKit",
+    "pre-installed. Use it for end-to-end tests and browser automation.",
+    "",
+    "## When to run E2E tests — project completion rule (DEFAULT, not opt-in)",
+    "",
+    "**After you finish a user-visible change to a project** — built a new",
+    "page, added a form, wired up auth, fixed a UI bug, anything the user",
+    "would interact with in a browser — you MUST run a Playwright E2E test",
+    "against what you built BEFORE telling the user \"done\".",
+    "",
+    "**Do this even when the user did NOT ask for tests.** The user does not",
+    "have to say \"and write an E2E test\" — E2E verification on completion",
+    "is the default behavior of this workspace. Asking the user \"should I",
+    "test it?\" is wrong — the answer is always yes unless one of the skip",
+    "rules below applies.",
+    "",
+    "Type-checks and unit tests prove the code compiles; they don't prove",
+    "the feature works. An E2E test is your last sanity check that the",
+    "thing actually does what was asked.",
+    "",
+    "### Procedure at completion time",
+    "",
+    "1. Make sure the dev server for the project is running and registered",
+    "   through `register_service` (so it has a reachable URL).",
+    "2. If the project doesn't have Playwright scaffolded yet, scaffold it",
+    "   (see \"Scaffolding\" below) — one-time cost per project.",
+    "3. Write a `.spec.ts` covering the golden path of what you just built.",
+    "   Keep it tight — 1-3 assertions, no exhaustive matrix.",
+    "4. Run the test inside `ai-ide-playwright` (see \"Running tests\" below).",
+    "5. Report the result to the user as part of your completion message:",
+    "   - ✓ pass → \"Built X. E2E test passes (1 spec, Ns).\"",
+    "   - ✗ fail → show the failure, fix it, re-run. Don't hand off broken.",
+    "",
+    "### When to SKIP this rule",
+    "",
+    "- Pure backend work with no UI surface (e.g. \"refactor this helper\").",
+    "- Doc / comment / config tweaks.",
+    "- One-shot scripts the user runs once and discards.",
+    "- The user explicitly says \"don't test\" or \"just code, no tests\".",
+    "- The feature can't be tested headlessly (file uploads from clipboard,",
+    "  native OS dialogs). In that case, tell the user you skipped the E2E",
+    "  step and why.",
+    "",
+    "### What a minimal completion test looks like",
+    "",
+    "```ts",
+    "// tests/<feature>.spec.ts",
+    "import { test, expect } from '@playwright/test';",
+    "",
+    "test('login form submits and lands on /dashboard', async ({ page }) => {",
+    "  await page.goto('http://host.docker.internal:3000/login');",
+    "  await page.getByLabel('Email').fill('demo@example.com');",
+    "  await page.getByLabel('Password').fill('demo-password');",
+    "  await page.getByRole('button', { name: /sign in/i }).click();",
+    "  await expect(page).toHaveURL(/\\/dashboard/);",
+    "});",
+    "```",
+    "",
+    "One test, golden path, real assertion. That's the bar.",
+    "",
+    "## Container quick reference",
+    "",
+    "- Image:    `mcr.microsoft.com/playwright:v1.49.0-jammy`",
+    "- Mount:    workspace root → `/work` inside the container (files you",
+    "            write there appear on the host immediately)",
+    "- Lifetime: `restart=unless-stopped` — assume it's already up",
+    "- Compose:  `~/AI-IDE/playwright/docker-compose.yml`",
+    "",
+    "## Scaffolding (first time only, per project subfolder)",
+    "",
+    "If the current project subfolder has no `tests/` + `playwright.config.*`:",
+    "",
+    "```bash",
+    "docker exec -w /work/<subfolder> ai-ide-playwright \\",
+    "  npm init playwright@latest -- --quiet --browser=chromium --lang=ts",
+    "```",
+    "",
+    "## Running tests",
+    "",
+    "Always exec inside the container — the host may not have Node, browsers,",
+    "or OS deps. Set the working dir to the project subfolder:",
+    "",
+    "```bash",
+    "docker exec -w /work/<subfolder> ai-ide-playwright npx playwright test",
+    "docker exec -w /work/<subfolder> ai-ide-playwright npx playwright test tests/login.spec.ts",
+    "docker exec -w /work/<subfolder> ai-ide-playwright npx playwright test --reporter=line",
+    "```",
+    "",
+    "## Reaching host services from inside the container",
+    "",
+    "A dev server on the host is NOT reachable as `localhost` from inside the",
+    "container. Use `host.docker.internal` instead:",
+    "",
+    "```ts",
+    "await page.goto('http://host.docker.internal:3000');",
+    "```",
+    "",
+    "For services already exposed through the workspace edge proxy (see the",
+    "Workspace environment section above), the public proxy URL works from",
+    "either the host or the container — prefer that.",
+    "",
+    "## Conventions",
+    "",
+    "- Place spec files under `<subfolder>/tests/`, suffix `.spec.ts`.",
+    "- Default to Chromium (`--browser=chromium`). It's the fastest and is",
+    "  what the AI panel itself drives.",
+    "- Headed / debug runs require a display server the container doesn't",
+    "  have. If the user wants a headed run, suggest they install Playwright",
+    "  locally instead and run on the host.",
+    "- After scaffolding, surface the test command back to the user as a",
+    "  one-line copy-paste — they'll want to re-run it.",
+    "",
+    "## Failure recovery",
+    "",
+    "If `docker exec ai-ide-playwright …` errors with **\"no such container\"**:",
+    "",
+    "1. Container probably isn't running. Bring it back up:",
+    "   `docker compose -f ~/AI-IDE/playwright/docker-compose.yml up -d`",
+    "2. If Docker itself is missing (`docker: command not found`), tell the",
+    "   user to re-run `scripts/cloud-init.sh` — Step 8 installs Docker AND",
+    "   starts the Playwright container.",
+    "",
+    "Do NOT try to install Playwright or browsers globally on the host as a",
+    "fallback — the container is the supported path. The host may be locked",
+    "down or missing OS deps the browsers need.",
+  ].join("\n");
+}
+
 // Tools whose response path we don't wire through our frontend. Populate as
 // new ones surface. AskUserQuestion now has a custom modal handler in the
 // frontend that intercepts the tool_use block, shows a popup, and sends the
@@ -358,6 +499,14 @@ export async function handleChatRequest(c: Context) {
               })()
             : message;
         const proxyContext = buildProxyContext();
+        const playwrightContext = buildPlaywrightContext();
+        // Combine workspace-environment context (URLs, ports, CORS, iframe
+        // rules, env packs) with the Playwright E2E-testing context. Both
+        // are appended verbatim to the system prompt — the model sees them
+        // as additional sections after the Claude Agent SDK's own prompt.
+        const appendedSystem = [proxyContext, playwrightContext]
+          .filter((s): s is string => Boolean(s))
+          .join("\n\n");
         const response = query({
           prompt: promptInput,
           options: {
@@ -370,11 +519,7 @@ export async function handleChatRequest(c: Context) {
             mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
             canUseTool,
             ...(permissionMode ? { permissionMode } : {}),
-            // Inject workspace-environment context (proxy URLs, port
-            // registration, CORS) so the model writes code that works in
-            // this multi-tenant environment instead of hard-coding
-            // localhost:port URLs the browser can't reach.
-            ...(proxyContext ? { appendSystemPrompt: proxyContext } : {}),
+            ...(appendedSystem ? { appendSystemPrompt: appendedSystem } : {}),
           },
         });
 
