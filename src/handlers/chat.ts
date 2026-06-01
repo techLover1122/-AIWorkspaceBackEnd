@@ -341,6 +341,132 @@ function buildPlaywrightContext(): string {
   ].join("\n");
 }
 
+/**
+ * HyperFrames video-generation context. Tells the model that when the
+ * user asks for any moving-image deliverable (product launch video, code
+ * walkthrough, social clip, animated explainer, etc.) it should follow
+ * the install-hyperframes skill — render HTML→MP4 inside the existing
+ * `ai-ide-playwright` Docker container.
+ *
+ * Installed by `skills/install-hyperframes/` and bootstrapped by the
+ * skill's own install.sh (FFmpeg + Node 22 + hyperframes CLI inside the
+ * container).
+ */
+function buildHyperframesContext(): string {
+  return [
+    "# Video generation with HyperFrames",
+    "",
+    "When the user asks for a **video / animation / explainer / social",
+    "clip / product launch reel / code walkthrough / data-viz animation**",
+    "— anything that produces an MP4 — use the `install-hyperframes`",
+    "skill at `~/.claude/skills/install-hyperframes/`.",
+    "",
+    "## When to invoke (default, not opt-in)",
+    "",
+    "Trigger this flow on ANY of these phrases (and similar):",
+    "- \"make a video\", \"create an animation\", \"render a clip\"",
+    "- \"animate this code\", \"walkthrough video\"",
+    "- \"product launch video\", \"explainer\", \"intro reel\"",
+    "- \"social clip\", \"TikTok\", \"Reel\", \"YouTube short\"",
+    "- \"animated chart\", \"data-viz video\"",
+    "",
+    "Do NOT refuse with \"I can't make videos\" — HyperFrames is the answer.",
+    "It renders HTML/CSS/JS animations to deterministic MP4 via Puppeteer",
+    "+ FFmpeg inside the `ai-ide-playwright` container.",
+    "",
+    "## Procedure summary",
+    "",
+    "1. **First time per workspace** — run the setup once (idempotent):",
+    "   ```bash",
+    "   bash ~/.claude/skills/install-hyperframes/install.sh",
+    "   ```",
+    "   This installs FFmpeg + Node 22 + hyperframes CLI + Python +",
+    "   google-genai SDK + the generate_asset.py helper inside the",
+    "   `ai-ide-playwright` container. Re-runs skip work that's done.",
+    "",
+    "1a. **Asset source** — ALWAYS ask the user before scaffolding:",
+    "    ```",
+    "    For this video I'll need some images. Two options:",
+    "    1) You upload them — drop files into",
+    "       ~/AI-IDE/videos/<slug>/assets/ via VS Code file explorer.",
+    "    2) I generate them with Gemini Imagen (~$0.04 per image,",
+    "       paid on the operator's Google AI account).",
+    "    Which would you like?",
+    "    ```",
+    "    Wait for the answer. Mixed responses are fine (\"my logo +",
+    "    you generate the background\") — handle each asset per-path.",
+    "",
+    "    For Gemini-generated assets, the call inside the container is:",
+    "    ```bash",
+    "    docker exec ai-ide-playwright python3 /opt/hyperframes/generate_asset.py \\",
+    "      --prompt \"<detailed description>\" \\",
+    "      --output /work/videos/<slug>/assets/<name>.png \\",
+    "      --aspect 16:9   # or 1:1 / 9:16 / 3:4 / 4:3",
+    "    ```",
+    "    Success line: `ok /work/...png (N bytes, 16:9)`.",
+    "    Non-zero exit → see SKILL.md \"Step 2.5\" for the error table.",
+    "",
+    "    If `GEMINI_API_KEY` isn't set, generate_asset.py exits 1 with a",
+    "    clear message. Tell the user the operator needs to add it to",
+    "    `/etc/workspace.env` and restart the playwright container.",
+    "    Don't pretend it worked — assets won't appear in the video.",
+    "",
+    "2. **Scaffold** under `~/AI-IDE/videos/<kebab-slug>/`:",
+    "   ```bash",
+    "   mkdir -p ~/AI-IDE/videos/<slug>",
+    "   docker exec -w /work/videos/<slug> ai-ide-playwright \\",
+    "     npx hyperframes init . --yes",
+    "   ```",
+    "",
+    "3. **Write the video** by editing `index.html` on the host (mounted",
+    "   into the container as `/work/videos/<slug>/`). Reference the",
+    "   RECIPES.md inside the skill for ready-made templates: product",
+    "   launch, vertical social, code walkthrough, animated bar chart.",
+    "",
+    "4. **Render**:",
+    "   ```bash",
+    "   docker exec -w /work/videos/<slug> ai-ide-playwright \\",
+    "     npx hyperframes render --output output.mp4",
+    "   ```",
+    "   This is the slow step (10-30s of wall-clock per 1s of video on",
+    "   t3.medium). Tell the user the wait upfront — don't promise sub-",
+    "   minute renders.",
+    "",
+    "5. **Surface the file** to the user with a one-off static-file",
+    "   server + `register_service`, so the MP4 opens as a clickable",
+    "   link in the chat:",
+    "   ```bash",
+    "   cd ~/AI-IDE/videos/<slug>",
+    "   python3 -m http.server 7100 &",
+    "   ```",
+    "   Then call `register_service(port=7100, name=\"video-<slug>\")` and",
+    "   surface the returned URL as:",
+    "   `[Watch <title>](http://video-<slug>-USER.DOMAIN/output.mp4)`",
+    "",
+    "## When to SKIP this skill",
+    "",
+    "- User asks for a static image / screenshot → use a regular",
+    "  Playwright screenshot, not a video render.",
+    "- User asks for realistic human faces / AI avatars → out of scope.",
+    "  HTML/CSS/JS only; explain the limitation and offer an animated",
+    "  illustrative alternative.",
+    "- User asks for audio narration → render the silent MP4 first, then",
+    "  tell them to mux audio separately with FFmpeg.",
+    "",
+    "## Honest limitations to surface",
+    "",
+    "- No audio track (video-only framework).",
+    "- Custom fonts need a `<link>` to a CDN (or base64-embedded font",
+    "  data for offline determinism).",
+    "- Render time scales linearly with duration × fps. A 30s video at",
+    "  1080p/60fps typically renders in 5-15 minutes.",
+    "",
+    "Don't promise what HyperFrames can't deliver — set expectations",
+    "before the user invests time in a long render that produces something",
+    "they didn't want.",
+  ].join("\n");
+}
+
 // Tools whose response path we don't wire through our frontend. Populate as
 // new ones surface. AskUserQuestion now has a custom modal handler in the
 // frontend that intercepts the tool_use block, shows a popup, and sends the
@@ -526,11 +652,12 @@ export async function handleChatRequest(c: Context) {
             : message;
         const proxyContext = buildProxyContext();
         const playwrightContext = buildPlaywrightContext();
-        // Combine workspace-environment context (URLs, ports, CORS, iframe
-        // rules, env packs) with the Playwright E2E-testing context. Both
-        // are appended verbatim to the system prompt — the model sees them
-        // as additional sections after the Claude Agent SDK's own prompt.
-        const appendedSystem = [proxyContext, playwrightContext]
+        const hyperframesContext = buildHyperframesContext();
+        // Combine the three workspace-environment contexts (URLs/ports/CORS/
+        // iframe rules + Playwright E2E + HyperFrames video) into one
+        // appendSystemPrompt blob. The model sees them as additional
+        // sections after the Claude Agent SDK's own prompt.
+        const appendedSystem = [proxyContext, playwrightContext, hyperframesContext]
           .filter((s): s is string => Boolean(s))
           .join("\n\n");
         const response = query({
