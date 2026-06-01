@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { handleChatRequest, handleAbortRequest } from "./handlers/chat.js";
 import { handleProjectsRequest } from "./handlers/projects.js";
@@ -34,6 +34,17 @@ import {
   handleListServices,
   handleRegisterService,
 } from "./handlers/services.js";
+import {
+  handleEditorConfig,
+  handleCallback,
+  handleFileFetch,
+  handleFileUpload,
+} from "./handlers/office.js";
+import {
+  handlePluginConfig,
+  handlePluginIndex,
+  handlePluginJs,
+} from "./handlers/plugin.js";
 import type { AppConfig } from "./types.js";
 
 export function createApp(config: AppConfig) {
@@ -79,6 +90,26 @@ export function createApp(config: AppConfig) {
   app.get("/api/services", handleListServices);
   app.post("/api/services", handleRegisterService);
 
+  // Office editors — bridges to the pre-installed ONLYOFFICE Docs
+  // Server containers (docs:4000 / sheets:4001). See handlers/office.ts.
+  //   POST /api/office/config           → signed editor config
+  //   POST /api/office/callback         → ONLYOFFICE save loop
+  //   GET  /api/office/file/:fileId     → ONLYOFFICE fetches docs here
+  //   PUT  /api/office/file/:fileId     → seed/replace file bytes
+  app.post("/api/office/config", handleEditorConfig);
+  app.post("/api/office/callback", handleCallback);
+  app.get("/api/office/file/:fileId", handleFileFetch);
+  app.put("/api/office/file/:fileId", handleFileUpload);
+
+  // ai-agent-bridge ONLYOFFICE plugin — three static assets served from
+  // this backend (rather than bind-mounted into the Docs containers).
+  // The editor config's `plugins.pluginsData` points at config.json and
+  // `plugins.autostart` triggers loading on every doc/sheet open. See
+  // handlers/plugin.ts for the loading topology.
+  app.get("/api/plugin/ai-agent-bridge/config.json", handlePluginConfig);
+  app.get("/api/plugin/ai-agent-bridge/index.html", handlePluginIndex);
+  app.get("/api/plugin/ai-agent-bridge/plugin.js", handlePluginJs);
+
   // User-curated URLs (new tab page bookmarks)
   app.get("/api/urls", handleListUrls);
   app.get("/api/urls/opened", handleListOpenedUrls);
@@ -98,7 +129,7 @@ export function createApp(config: AppConfig) {
   // pending canUseTool callback inside an in-flight chat request.
   app.post("/api/permission/:id", handlePermissionDecision);
 
-  app.get("/api/health", (c) => c.json({ status: "ok", debug: config.debug }));
+  app.get("/api/health", (c: Context) => c.json({ status: "ok", debug: config.debug }));
 
   return app;
 }

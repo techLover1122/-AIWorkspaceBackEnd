@@ -521,6 +521,299 @@ function makeCreatePackTool(workspaceDir: string | undefined) {
   );
 }
 
+/* ─────────────── docs_* / sheets_* tools (office agents) ─────────────── */
+
+/**
+ * Loopback URLs of the two ONLYOFFICE-bridge sidecars cloud-init starts
+ * (see ai-ide-docs-agent.service / ai-ide-sheets-agent.service). The
+ * backend and the agents share the EC2, so direct 127.0.0.1 calls
+ * skip the Traefik round-trip. Override via env if the agents ever
+ * move off-box.
+ */
+const DOCS_AGENT_URL = process.env.DOCS_AGENT_URL ?? "http://localhost:4100";
+const SHEETS_AGENT_URL =
+  process.env.SHEETS_AGENT_URL ?? "http://localhost:4101";
+
+/**
+ * Forward a single { op, args } payload to the matching agent's /cmd
+ * endpoint and return the agent's `result`. Throws if the agent reports
+ * `ok=false` or HTTP-level failure — the tool wrappers turn that into
+ * a `content: text` error so the model can recover.
+ */
+async function callAgent(
+  kind: "docs" | "sheets",
+  op: string,
+  args: unknown
+): Promise<unknown> {
+  const url = kind === "docs" ? DOCS_AGENT_URL : SHEETS_AGENT_URL;
+  const res = await fetch(`${url}/cmd`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ op, args }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`${kind}-agent /cmd failed: HTTP ${res.status} ${text}`);
+  }
+  const data = (await res.json()) as {
+    ok?: boolean;
+    result?: unknown;
+    error?: string;
+  };
+  if (!data.ok) {
+    throw new Error(data.error ?? `${kind}-agent returned ok=false`);
+  }
+  return data.result;
+}
+
+function asText(s: string) {
+  return { content: [{ type: "text" as const, text: s }] };
+}
+
+function fmtErr(prefix: string, err: unknown) {
+  const msg = err instanceof Error ? err.message : String(err);
+  // The agent's most common failure mode is "no editor session
+  // connected" — surface that distinctly so the model knows to ask the
+  // user to open the document instead of retrying.
+  if (msg.includes("no ") && msg.includes("editor session connected")) {
+    return asText(
+      `${prefix}: ${msg}. Ask the user to open the document in the workspace editor first.`
+    );
+  }
+  return asText(`${prefix}: ${msg}`);
+}
+
+/* ─── sheets ops ─── */
+
+export const sheetsSetValueTool = tool(
+  "sheets_set_value",
+  "Set the value of a single cell in the open XLSX spreadsheet via the sheets-agent. The user must have the sheet open at sheets-<USER_ID>.<PLATFORM_DOMAIN>. Accepts A1-style refs.",
+  {
+    cell: z
+      .string()
+      .describe("A1-style cell reference, e.g. 'A1', 'B12', 'Sheet2!C3'."),
+    value: z
+      .union([z.string(), z.number(), z.boolean()])
+      .describe(
+        "Value to set. Strings are written as text, numbers as numbers, booleans as booleans. For formulas use sheets_set_formula instead."
+      ),
+  },
+  async ({ cell, value }) => {
+    try {
+      await callAgent("sheets", "sheets_set_value", { cell, value });
+      return asText(`Set ${cell} = ${JSON.stringify(value)}.`);
+    } catch (err) {
+      return fmtErr(`Failed to set ${cell}`, err);
+    }
+  }
+);
+
+export const sheetsSetRangeTool = tool(
+  "sheets_set_range",
+  "Write a 2D block of values to a range in the open XLSX spreadsheet. The range and values dimensions must match (rows × cols). Use this instead of repeated sheets_set_value calls when populating multiple cells.",
+  {
+    range: z
+      .string()
+      .describe("A1-style range, e.g. 'A1:C3', 'Sheet1!B2:D5'."),
+    values: z
+      .array(
+        z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))
+      )
+      .describe(
+        "2D array of values, row-major. Outer length = number of rows, inner length = number of cols."
+      ),
+  },
+  async ({ range, values }) => {
+    try {
+      await callAgent("sheets", "sheets_set_range", { range, values });
+      const rows = values.length;
+      const cols = values[0]?.length ?? 0;
+      return asText(`Wrote ${rows}×${cols} block to ${range}.`);
+    } catch (err) {
+      return fmtErr(`Failed to write range ${range}`, err);
+    }
+  }
+);
+
+export const sheetsGetRangeTool = tool(
+  "sheets_get_range",
+  "Read the current value(s) of a cell or range from the open XLSX spreadsheet. Returns a single value for a single cell; for multi-cell ranges, returns a 2D array. Use this before sheets_set_range when you need to read-modify-write.",
+  {
+    range: z
+      .string()
+      .describe("A1-style cell or range, e.g. 'A1', 'A1:C3'."),
+  },
+  async ({ range }) => {
+    try {
+      const result = (await callAgent("sheets", "sheets_get_range", {
+        range,
+      })) as { value?: unknown };
+      return asText(
+        `Value at ${range}: ${JSON.stringify(result?.value ?? null)}`
+      );
+    } catch (err) {
+      return fmtErr(`Failed to read ${range}`, err);
+    }
+  }
+);
+
+export const sheetsSetFormulaTool = tool(
+  "sheets_set_formula",
+  "Set a formula on a cell in the open XLSX spreadsheet. Pass the formula body WITHOUT the leading '=' — e.g. 'SUM(A1:A10)' not '=SUM(A1:A10)'.",
+  {
+    cell: z.string().describe("A1-style cell reference, e.g. 'D1'."),
+    formula: z
+      .string()
+      .describe(
+        "Formula body, e.g. 'SUM(A1:A10)', 'A1*B1', 'IF(A1>0,\"pos\",\"neg\")'. The leading '=' is added automatically."
+      ),
+  },
+  async ({ cell, formula }) => {
+    try {
+      await callAgent("sheets", "sheets_set_formula", { cell, formula });
+      return asText(`Set ${cell} = =${formula}`);
+    } catch (err) {
+      return fmtErr(`Failed to set formula on ${cell}`, err);
+    }
+  }
+);
+
+export const sheetsClearRangeTool = tool(
+  "sheets_clear_range",
+  "Clear the values + formulas in a range of the open XLSX spreadsheet, leaving formatting intact. Use sheets_set_range with explicit empty strings if you only want to overwrite without clearing formats.",
+  {
+    range: z
+      .string()
+      .describe("A1-style range to clear, e.g. 'A1:C10', 'Sheet1!B:B'."),
+  },
+  async ({ range }) => {
+    try {
+      await callAgent("sheets", "sheets_clear_range", { range });
+      return asText(`Cleared ${range}.`);
+    } catch (err) {
+      return fmtErr(`Failed to clear ${range}`, err);
+    }
+  }
+);
+
+export const sheetsListSheetsTool = tool(
+  "sheets_list_sheets",
+  "Return the names of every tab in the currently-open XLSX workbook, in order. Use this before sheets_add_sheet if you need to avoid name collisions, or before targeted sheets_set_* calls on a specific sheet.",
+  {},
+  async () => {
+    try {
+      const result = (await callAgent("sheets", "sheets_list_sheets", {})) as {
+        names?: string[];
+      };
+      const names = result?.names ?? [];
+      if (names.length === 0) return asText("No sheets found.");
+      return asText(`Sheets (${names.length}): ${names.join(", ")}`);
+    } catch (err) {
+      return fmtErr("Failed to list sheets", err);
+    }
+  }
+);
+
+export const sheetsAddSheetTool = tool(
+  "sheets_add_sheet",
+  "Add a new (empty) sheet tab to the open XLSX workbook with the given name. Fails if a sheet of that name already exists. Use sheets_list_sheets first if you need to check.",
+  {
+    name: z.string().describe("Name of the new sheet tab."),
+  },
+  async ({ name }) => {
+    try {
+      await callAgent("sheets", "sheets_add_sheet", { name });
+      return asText(`Added sheet "${name}".`);
+    } catch (err) {
+      return fmtErr(`Failed to add sheet "${name}"`, err);
+    }
+  }
+);
+
+/* ─── docs ops ─── */
+
+export const docsGetTextTool = tool(
+  "docs_get_text",
+  "Return the full plain-text content of the open DOCX document. Use this as the read step before docs_insert_text or docs_replace_text so you can see what's already there.",
+  {},
+  async () => {
+    try {
+      const result = (await callAgent("docs", "docs_get_text", {})) as {
+        text?: string;
+      };
+      const text = result?.text ?? "";
+      if (!text) return asText("Document is empty.");
+      return asText(`Document text (${text.length} chars):\n\n${text}`);
+    } catch (err) {
+      return fmtErr("Failed to read document text", err);
+    }
+  }
+);
+
+export const docsInsertTextTool = tool(
+  "docs_insert_text",
+  "Append plain text to the end of the open DOCX document. For replacing existing text use docs_replace_text; for inserting at a specific location, ask the user to place the cursor first then use docs_replace_text against a known marker.",
+  {
+    text: z
+      .string()
+      .describe("Text to append. Use '\\n' for line breaks within a paragraph."),
+  },
+  async ({ text }) => {
+    try {
+      await callAgent("docs", "docs_insert_text", { text });
+      return asText(`Appended ${text.length} chars to document.`);
+    } catch (err) {
+      return fmtErr("Failed to insert text", err);
+    }
+  }
+);
+
+export const docsReplaceTextTool = tool(
+  "docs_replace_text",
+  "Find every occurrence of `find` in the open DOCX document and replace with `replace`. Returns how many replacements were made. Case-insensitive unless matchCase is true.",
+  {
+    find: z.string().describe("Text to search for (must be non-empty)."),
+    replace: z.string().describe("Replacement text. Pass '' to delete matches."),
+    matchCase: z
+      .boolean()
+      .optional()
+      .describe("If true, match exactly. Default false (case-insensitive)."),
+  },
+  async ({ find, replace, matchCase }) => {
+    try {
+      await callAgent("docs", "docs_replace_text", { find, replace, matchCase });
+      return asText(
+        `Replaced "${find}" → "${replace}" in document${
+          matchCase ? " (case-sensitive)" : ""
+        }.`
+      );
+    } catch (err) {
+      return fmtErr("Failed to replace text", err);
+    }
+  }
+);
+
+export const docsApplyHeadingTool = tool(
+  "docs_apply_heading",
+  "Apply a heading style (Heading 1-6) to the user's current selection in the open DOCX document. Requires the user to have made a selection — call docs_get_text first if you need to see what's there.",
+  {
+    level: z
+      .number()
+      .int()
+      .min(1)
+      .max(6)
+      .describe("Heading level, 1-6."),
+  },
+  async ({ level }) => {
+    try {
+      await callAgent("docs", "docs_apply_heading", { level });
+      return asText(`Applied Heading ${level} to current selection.`);
+    } catch (err) {
+      return fmtErr(`Failed to apply Heading ${level}`, err);
+    }
+  }
+);
+
 export function createAiideMcpServer(opts: { workspaceDir?: string } = {}) {
   return createSdkMcpServer({
     name: "aiide",
@@ -535,6 +828,18 @@ export function createAiideMcpServer(opts: { workspaceDir?: string } = {}) {
       deleteBookmarkTool,
       scanPortsTool,
       makeCreatePackTool(opts.workspaceDir),
+      // Office agent bridges (Phase 6) — see callAgent + agent.ts.
+      sheetsSetValueTool,
+      sheetsSetRangeTool,
+      sheetsGetRangeTool,
+      sheetsSetFormulaTool,
+      sheetsClearRangeTool,
+      sheetsListSheetsTool,
+      sheetsAddSheetTool,
+      docsGetTextTool,
+      docsInsertTextTool,
+      docsReplaceTextTool,
+      docsApplyHeadingTool,
     ],
   });
 }
