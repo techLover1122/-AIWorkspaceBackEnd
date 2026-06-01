@@ -201,6 +201,168 @@ function buildProxyContext(): string | null {
 }
 
 /**
+ * Completion-verification context — the broad "auto-test before declaring
+ * done" rule. Whatever Claude does (write code, refactor, fix a bug, add
+ * a feature), it MUST run the project's verification suite (type-check,
+ * lint, unit tests, build) and fix any failures before telling the user
+ * "done". This catches the most common AI-assist failure mode where a
+ * model "completes" a task that doesn't actually compile or pass tests.
+ *
+ * Sits BEFORE the Playwright section in the appendedSystem array because
+ * the broader checks should run first — type errors mean the E2E test
+ * would fail anyway, and we want clear sequential signal.
+ */
+function buildCompletionVerificationContext(): string {
+  return [
+    "# Completion verification — auto-test EVERY prompt before declaring \"done\"",
+    "",
+    "After completing ANY user request that touches code in a project,",
+    "BEFORE saying \"done\" / \"I've finished\" / \"here you go\":",
+    "",
+    "## Default rule (not opt-in)",
+    "",
+    "Run the project's full verification suite. If anything fails, fix",
+    "the root cause and re-run until clean. ONLY THEN tell the user.",
+    "",
+    "Do this even when the user did NOT ask for tests — verification on",
+    "completion is the default behavior of this workspace. Stops the most",
+    "common failure mode: \"AI says done, code doesn't actually compile\".",
+    "",
+    "## Step 1 — identify the project type",
+    "",
+    "Look at the project's manifest files in the working directory:",
+    "",
+    "| File found             | Project type |",
+    "| ---------------------- | ------------ |",
+    "| `package.json`         | Node / TypeScript / JavaScript |",
+    "| `pyproject.toml`       | Python (modern) |",
+    "| `requirements.txt`     | Python (legacy) |",
+    "| `Cargo.toml`           | Rust |",
+    "| `go.mod`               | Go |",
+    "| `__manifest__.py`      | Odoo addon |",
+    "| `composer.json`        | PHP |",
+    "",
+    "## Step 2 — run checks IN ORDER",
+    "",
+    "Stop at the first failure, fix, then resume from where you stopped.",
+    "Don't run all checks in parallel — sequential gives clearer signal.",
+    "",
+    "### Node / TypeScript",
+    "",
+    "```bash",
+    "# Always run in the project's directory",
+    "cd <project-dir>",
+    "",
+    "# 1. Type check (fastest, catches the most bugs)",
+    "[ -f tsconfig.json ] && npx tsc --noEmit",
+    "",
+    "# 2. Lint (style + simple bugs)",
+    "[ -f .eslintrc.json ] || [ -f .eslintrc.js ] || [ -f eslint.config.js ] \\",
+    "  && npx eslint . --max-warnings 0",
+    "",
+    "# 3. Unit tests (if a test script exists in package.json)",
+    "npm pkg get scripts.test 2>/dev/null | grep -v '\"\"' \\",
+    "  && npm test --silent",
+    "",
+    "# 4. Build (catches things type-check misses — bundler / loader errors)",
+    "npm pkg get scripts.build 2>/dev/null | grep -v '\"\"' \\",
+    "  && npm run build",
+    "```",
+    "",
+    "### Python",
+    "",
+    "```bash",
+    "cd <project-dir>",
+    "",
+    "# 1. Type check (if mypy or pyright config exists)",
+    "[ -f mypy.ini ] || grep -q '\\[tool.mypy\\]' pyproject.toml 2>/dev/null \\",
+    "  && python -m mypy .",
+    "",
+    "# 2. Lint",
+    "command -v ruff && ruff check .",
+    "",
+    "# 3. Tests",
+    "[ -d tests ] || [ -d test ] && pytest -q",
+    "```",
+    "",
+    "### Rust",
+    "```bash",
+    "cargo check && cargo clippy -- -D warnings && cargo test --no-fail-fast",
+    "```",
+    "",
+    "### Odoo addon",
+    "```bash",
+    "# Smoke-test by installing/upgrading the module — catches manifest,",
+    "# import, and XML view errors that nothing else does.",
+    "docker exec ai-ide-playwright /work/odoo19/odoo-bin \\",
+    "  -d <db> -u <module> --stop-after-init --no-http",
+    "# (Or use the user's existing tmux odoo session and `--dev=all`.)",
+    "```",
+    "",
+    "### Go",
+    "```bash",
+    "go vet ./... && go test ./...",
+    "```",
+    "",
+    "## Step 3 — handle failures",
+    "",
+    "On ANY non-zero exit:",
+    "",
+    "1. Read the error message — the actual error, not just the summary.",
+    "2. Find the root cause in the code. Don't suppress (`// @ts-ignore`,",
+    "   `# type: ignore`, `eslint-disable`) unless the rule itself is wrong",
+    "   and the user agrees.",
+    "3. Apply the fix to the source.",
+    "4. Re-run the SAME check that failed.",
+    "5. If still failing after 5 attempts on the same error, STOP and ask",
+    "   the user — don't keep flailing.",
+    "",
+    "## Step 4 — for UI changes, ALSO run E2E",
+    "",
+    "If the change is user-visible (new page, form, button, layout), after",
+    "the above checks pass, run the Playwright E2E rule described in the",
+    "next section. That's the final sanity check that the feature actually",
+    "WORKS in a browser, not just that the code compiles.",
+    "",
+    "## Step 5 — report what you ran",
+    "",
+    "When telling the user you're done, list exactly what passed:",
+    "",
+    "> Built the login form. Verified:",
+    "> ✓ tsc clean (0 errors)",
+    "> ✓ eslint clean (0 warnings)",
+    "> ✓ 12/12 unit tests pass",
+    "> ✓ npm run build succeeds (1.2 MB bundle)",
+    "> ✓ Playwright E2E: login.spec.ts passes (2.4s, Chromium)",
+    "",
+    "Specific numbers > vague \"everything looks good\". The user should",
+    "be able to trust the report without re-running the checks themselves.",
+    "",
+    "## When to SKIP this rule",
+    "",
+    "- Pure config / doc edits (no compile target)",
+    "- One-shot scripts the user runs once (no project context)",
+    "- User explicitly says \"don't test\" / \"just code\" / \"skip verification\"",
+    "- The project has no recognized manifest (rare — pretty much only",
+    "  raw script directories)",
+    "- Working in a read-only inspection mode (no code changes)",
+    "",
+    "## Don't lie about results",
+    "",
+    "If a check timed out or you couldn't reach the runner, SAY THAT.",
+    "Don't say \"all checks passed\" when you didn't actually run them.",
+    "Don't say \"build succeeds\" if you only got past the type check.",
+    "The user trusts your report — keep that trust by being accurate.",
+    "",
+    "Concrete failure-honesty examples:",
+    "- Bad:  \"All tests pass, everything looks good!\"  (when you didn't",
+    "        actually run them because the test command hung)",
+    "- Good: \"tsc clean, eslint clean. Tests took >2 min and I aborted —",
+    "        please run `npm test` locally to verify the 3 changed specs.\"",
+  ].join("\n");
+}
+
+/**
  * Playwright E2E-testing context appended to every chat request's system
  * prompt. Tells the model that a long-running `ai-ide-playwright` Docker
  * container is available with Playwright + Chromium + Firefox + WebKit
@@ -796,19 +958,24 @@ export async function handleChatRequest(c: Context) {
               })()
             : message;
         const proxyContext = buildProxyContext();
+        const completionContext = buildCompletionVerificationContext();
         const playwrightContext = buildPlaywrightContext();
         const hyperframesContext = buildHyperframesContext();
         const persistenceContext = buildPersistenceContext();
-        // Combine the four workspace-environment contexts into one
+        // Combine the five workspace-environment contexts into one
         // appendSystemPrompt blob. The model sees them as additional
         // sections after the Claude Agent SDK's own prompt:
-        //   1. proxyContext     — URLs / ports / CORS / iframe rules
-        //   2. playwrightContext — E2E testing default rule
-        //   3. hyperframesContext — HTML→MP4 video gen
-        //   4. persistenceContext — tmux/setsid for long-running processes
-        //                           (so dev servers survive browser-close)
+        //   1. proxyContext       — URLs / ports / CORS / iframe rules
+        //   2. completionContext  — broad verification suite (type-check,
+        //                           lint, unit, build) before "done"
+        //   3. playwrightContext  — E2E testing default rule (UI changes)
+        //   4. hyperframesContext — HTML→MP4 video gen
+        //   5. persistenceContext — tmux/recipes for long-running processes
+        //                           (so dev servers survive browser-close
+        //                           and EC2 reboots)
         const appendedSystem = [
           proxyContext,
+          completionContext,
           playwrightContext,
           hyperframesContext,
           persistenceContext,
