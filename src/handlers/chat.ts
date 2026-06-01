@@ -467,6 +467,119 @@ function buildHyperframesContext(): string {
   ].join("\n");
 }
 
+/**
+ * Long-running-process persistence context. Bash commands Claude runs
+ * via the SDK are children of the chat-handler process; when the user
+ * closes the browser tab the chat session ends and those children get
+ * SIGKILL'd. Dev servers / watchers / daemons die with the session —
+ * Traefik's registration survives, so the user comes back, opens the
+ * URL, and gets a 502 Bad Gateway with no obvious cause.
+ *
+ * The fix is on the spawn side: detach long-running processes via tmux
+ * (preferred — re-attachable) or setsid + nohup. This context teaches
+ * the model the pattern so the user doesn't have to ask.
+ */
+function buildPersistenceContext(): string {
+  return [
+    "# Long-running processes — persistence across chat sessions",
+    "",
+    "When you start any process that should outlive THIS chat (dev",
+    "servers, watchers, daemons, log followers), DO NOT run it directly",
+    "with bash — the process becomes a child of the chat handler and gets",
+    "killed when the user closes the browser or the session ends. The",
+    "Traefik service registration survives that kill, so the next time",
+    "the user opens the workspace URL they see a 502 Bad Gateway with",
+    "no obvious cause.",
+    "",
+    "ALWAYS wrap long-running processes in one of these patterns:",
+    "",
+    "## Pattern A — tmux (preferred)",
+    "",
+    "Re-attachable; the user can `tmux attach -t <name>` later to see live",
+    "output. Best default for dev servers.",
+    "",
+    "```bash",
+    "tmux new -d -s <session-name> 'cd <dir> && <command>'",
+    "```",
+    "",
+    "Examples:",
+    "```bash",
+    "tmux new -d -s frontend 'cd ~/AI-IDE/frontend && npm run dev'",
+    "tmux new -d -s backend  'cd ~/AI-IDE/backend  && npm run dev'",
+    "tmux new -d -s vite     'cd ~/AI-IDE/my-app   && npm run dev'",
+    "```",
+    "",
+    "Re-attach (visible to user):  `tmux attach -t frontend`",
+    "Detach without killing:       Ctrl+B then D",
+    "Kill the session:             `tmux kill-session -t <session-name>`",
+    "List sessions:                `tmux ls`",
+    "",
+    "## Pattern B — setsid + nohup (fallback)",
+    "",
+    "Use when tmux isn't appropriate (no re-attach needed, fire-and-forget).",
+    "",
+    "```bash",
+    "setsid nohup <command> > /tmp/<name>.log 2>&1 < /dev/null &",
+    "disown",
+    "```",
+    "",
+    "The combination fully detaches: setsid creates a new session, nohup",
+    "ignores SIGHUP, I/O is redirected away from the terminal, disown",
+    "removes the job from the shell's job table.",
+    "",
+    "## When the rule applies",
+    "",
+    "Use a persistent wrapper for ALL of these (long-running, port-binding):",
+    "",
+    "- `npm/yarn/pnpm run dev | start | serve | preview`",
+    "- `next dev`, `vite`, `webpack serve`, `parcel serve`",
+    "- `python -m http.server`, `flask run`, `uvicorn`, `fastapi dev`",
+    "- `docker compose up` (without `-d`)",
+    "- `tail -f`, `watch`, log followers",
+    "- anything that prints continuously and doesn't exit",
+    "",
+    "DO NOT wrap one-shot commands (they finish before session end):",
+    "- `npm install`, `git clone`, `mkdir`, `cp`, `mv`",
+    "- `npm run build`, `tsc`, lint runs",
+    "- `docker compose up -d` (already detached by `-d`)",
+    "",
+    "## After starting — verify it actually persisted",
+    "",
+    "ALWAYS confirm the port is listening before claiming the service",
+    "is up:",
+    "",
+    "```bash",
+    "sleep 3 && ss -tlnp 2>/dev/null | grep ':<port> ' \\",
+    "  || echo 'WARNING: nothing listening on <port>'",
+    "```",
+    "",
+    "Then register + surface the URL:",
+    "",
+    "```",
+    "register_service(port=<port>, name=\"<service-name>\")",
+    "→ returns public URL",
+    "```",
+    "",
+    "And reply with the link button: `[Open <name>](<url>)`.",
+    "",
+    "## When the user reports \"Bad Gateway\" or \"502\"",
+    "",
+    "Almost always means: registration entry exists but the upstream",
+    "process is dead. Diagnose in order:",
+    "",
+    "1. `ss -tlnp | grep ':<port>'` — empty means the process is dead.",
+    "2. `tmux ls` — see if the tmux session that was supposed to host",
+    "   it is still around. If not, the user closed the browser and",
+    "   the previous (non-tmux) process died.",
+    "3. Restart with one of the persistent patterns above.",
+    "4. Verify again — only THEN tell the user the service is back.",
+    "",
+    "Don't say \"everything looks fine\" without actually checking the",
+    "upstream process — that's the most common failure mode users hit",
+    "and it makes the workspace feel broken.",
+  ].join("\n");
+}
+
 // Tools whose response path we don't wire through our frontend. Populate as
 // new ones surface. AskUserQuestion now has a custom modal handler in the
 // frontend that intercepts the tool_use block, shows a popup, and sends the
@@ -653,11 +766,21 @@ export async function handleChatRequest(c: Context) {
         const proxyContext = buildProxyContext();
         const playwrightContext = buildPlaywrightContext();
         const hyperframesContext = buildHyperframesContext();
-        // Combine the three workspace-environment contexts (URLs/ports/CORS/
-        // iframe rules + Playwright E2E + HyperFrames video) into one
+        const persistenceContext = buildPersistenceContext();
+        // Combine the four workspace-environment contexts into one
         // appendSystemPrompt blob. The model sees them as additional
-        // sections after the Claude Agent SDK's own prompt.
-        const appendedSystem = [proxyContext, playwrightContext, hyperframesContext]
+        // sections after the Claude Agent SDK's own prompt:
+        //   1. proxyContext     — URLs / ports / CORS / iframe rules
+        //   2. playwrightContext — E2E testing default rule
+        //   3. hyperframesContext — HTML→MP4 video gen
+        //   4. persistenceContext — tmux/setsid for long-running processes
+        //                           (so dev servers survive browser-close)
+        const appendedSystem = [
+          proxyContext,
+          playwrightContext,
+          hyperframesContext,
+          persistenceContext,
+        ]
           .filter((s): s is string => Boolean(s))
           .join("\n\n");
         const response = query({
