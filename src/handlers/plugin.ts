@@ -128,7 +128,23 @@ const PLUGIN_JS = `(function () {
         parentHost = window.location.host;
       }
     }
-    var wsHost = parentHost.replace(/^(docs|sheets)-/, "$1-agent-");
+    // Primary mapping: docs-<USER>.<DOMAIN> → docs-agent-<USER>.<DOMAIN>.
+    // Aliases: when edit/page.tsx rewrites the script URL to port-4000-
+    // (because the docs- subdomain is broken on this workspace), the
+    // editor iframe lives there too — map it to the docs agent. Same
+    // for port-4001- → sheets-agent-. Replacements are mutually
+    // exclusive: pick the first prefix that matches, otherwise leave
+    // parentHost unchanged (lets the agent reject unknown hosts cleanly).
+    var wsHost;
+    if (/^port-4000-/.test(parentHost)) {
+      wsHost = parentHost.replace(/^port-4000-/, "docs-agent-");
+    } else if (/^port-4001-/.test(parentHost)) {
+      wsHost = parentHost.replace(/^port-4001-/, "sheets-agent-");
+    } else if (/^(docs|sheets)-/.test(parentHost)) {
+      wsHost = parentHost.replace(/^(docs|sheets)-/, "$1-agent-");
+    } else {
+      wsHost = parentHost;
+    }
     var scheme = window.location.protocol === "https:" ? "wss" : "ws";
     return scheme + "://" + wsHost + "/plugin";
   }
