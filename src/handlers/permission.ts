@@ -68,12 +68,27 @@ export function createPendingPermission(args: {
   return { id, promise };
 }
 
-/** Auto-deny + cleanup. Used on stream abort or timeout. */
+/** Auto-deny + cleanup. Used on stream abort or task end. */
 export function denyPending(id: string, message: string): boolean {
   const entry = pending.get(id);
   if (!entry) return false;
   pending.delete(id);
   entry.resolve({ behavior: "deny", message });
+  return true;
+}
+
+/**
+ * Server-side auto-ALLOW + cleanup. Used when the 5-min user-response
+ * timeout fires — we presume the user is away and let the task continue
+ * without blocking on a decision. Mirrors the allow-branch behavior of
+ * handlePermissionDecision (which feeds `updatedInput` back so the SDK's
+ * runtime Zod schema accepts the result).
+ */
+export function autoAllowPending(id: string): boolean {
+  const entry = pending.get(id);
+  if (!entry) return false;
+  pending.delete(id);
+  entry.resolve({ behavior: "allow", updatedInput: entry.input });
   return true;
 }
 
@@ -146,4 +161,29 @@ export async function handlePermissionDecision(c: Context): Promise<Response> {
 /** Diagnostic helper — current pending count. */
 export function pendingCount(): number {
   return pending.size;
+}
+
+/**
+ * Check whether a permission id is still waiting on the user.
+ * Used by the chat stream handler on reattach: if a client comes back
+ * mid-prompt, we re-emit any permission_request event whose id is
+ * still in this map, so the user sees the prompt again.
+ *
+ * NOTE on lifetime: pending Promises resolve via ONE of:
+ *   1. The user answers via POST /api/permission/:id
+ *   2. The owning task is aborted via /api/abort/:taskId
+ *   3. The task itself errors / completes (runChatTask finally drains)
+ *   4. The 5-minute user-absent auto-allow timer fires (see
+ *      PERMISSION_WAIT_MS in chat.ts) — resolves with "allow" and
+ *      flips the task into absent-mode for the rest of its lifetime
+ *   5. The backend process restarts (in-memory map dies)
+ *
+ * Browser tab close / network drop / workspace re-open are NOT direct
+ * triggers — but they STARVE the user-response path, so the 5-min
+ * timer is usually what fires for those cases. The user can come back
+ * within 5 min and respond normally; longer than that and the task
+ * has already auto-progressed.
+ */
+export function isPending(id: string): boolean {
+  return pending.has(id);
 }

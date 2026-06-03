@@ -1,15 +1,48 @@
 import { Context } from "hono";
 import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync } from "node:fs";
-import type { ChatRequest, StreamResponse } from "../types.js";
+import type { ChatRequest } from "../types.js";
 import { info, warn, error as logError } from "../utils/logger.js";
 import { recordSession } from "../utils/db.js";
 import { createAiideMcpServer } from "../mcp/aiideTools.js";
 import {
+  createTask,
+  pushEvent,
+  setTaskSessionId,
+  setTaskStatus,
+  setTaskAbsentMode,
+  abortTask as abortTaskInRegistry,
+  getTask,
+} from "../utils/taskRegistry.js";
+import {
   createPendingPermission,
   denyPending,
+  autoAllowPending,
   type PermissionRequestPayload,
 } from "./permission.js";
+
+/**
+ * How long canUseTool waits on a user permission decision before
+ * auto-allowing and switching the task to "absent mode" (every
+ * subsequent canUseTool in this task auto-allows without waiting).
+ *
+ * The user explicitly requested this: long unattended runs (e.g. E2E
+ * testing flows) shouldn't stall on every tool prompt if they've stepped
+ * away. They'd rather have the task complete autonomously than have it
+ * pause forever waiting on a click.
+ *
+ * Trade-off: this WILL run tools without a real consent if the user is
+ * gone for 5+ minutes. Acceptable because:
+ *   - The user opted into this behavior knowingly.
+ *   - They can still Stop the task via the abort button.
+ *   - Real destructive tools (rm -rf etc.) are still gated by the SDK's
+ *     own deny rules — the canUseTool ask only fires for tools the SDK
+ *     considers borderline.
+ *   - bypassPermissions mode (set upfront via the chat header chip)
+ *     already skips canUseTool entirely; absent-mode is the on-demand
+ *     equivalent for partial-attended sessions.
+ */
+const PERMISSION_WAIT_MS = 5 * 60 * 1000;
 
 // MCP tool names must be prefixed with `mcp__<server>__` in allowedTools.
 const MCP_TOOL_NAMES = [
@@ -932,16 +965,26 @@ function buildCodeOrganizationContext(): string {
 const DISALLOWED_TOOLS: string[] = [
 ];
 
-const abortControllers = new Map<string, AbortController>();
-
-export function abortRequest(requestId: string): boolean {
-  const controller = abortControllers.get(requestId);
-  if (!controller) return false;
-  controller.abort();
-  abortControllers.delete(requestId);
-  return true;
+/**
+ * Backwards-compatible abort path. The frontend's existing
+ * `/api/abort/:requestId` route stays wired up — we just delegate to the
+ * task registry now. requestId === taskId (the frontend's generated id),
+ * so a single registry lookup does the job.
+ */
+export function abortRequest(taskId: string): boolean {
+  return abortTaskInRegistry(taskId);
 }
 
+/**
+ * POST /api/chat
+ *
+ * Starts a background SDK task and returns `{ taskId }` immediately. The
+ * SDK call runs detached in the task registry — surviving HTTP client
+ * disconnects, browser closes, and network blips. The caller (or any
+ * subsequent caller) reads the event stream from
+ * `GET /api/chat/stream/:taskId` and can resume from any seq via
+ * `?from=<seq>` after a reconnect.
+ */
 export async function handleChatRequest(c: Context) {
   const body = (await c.req.json()) as ChatRequest;
   const {
@@ -971,323 +1014,362 @@ export async function handleChatRequest(c: Context) {
     messagePreview: typeof message === "string" ? message.slice(0, 120) : null,
   });
 
+  // Idempotent re-POST: if the frontend retries with the same id (auto-
+  // retry on a flaky network), don't start a second SDK call. Return the
+  // existing task — the stream endpoint will pick up from wherever it is.
+  if (getTask(requestId)) {
+    return c.json({ taskId: requestId, existed: true });
+  }
+
   const abortController = new AbortController();
-  abortControllers.set(requestId, abortController);
+  const taskId = requestId;
+  createTask({
+    taskId,
+    workingDirectory: safeCwd ?? null,
+    abortController,
+  });
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      // `controller.enqueue` throws after the stream is closed (e.g. the
-      // heartbeat interval fires once more between `controller.close()` and
-      // the JS event loop catching up). Swallow that specific case so a
-      // shutdown race doesn't crash the request.
-      let closed = false;
-      const send = (data: StreamResponse) => {
-        if (closed) return;
-        try {
-          controller.enqueue(new TextEncoder().encode(JSON.stringify(data) + "\n"));
-        } catch {
-          // Stream already closed — nothing more we can do.
-          closed = true;
-        }
-      };
+  // Kick off the SDK runner in the background. We deliberately don't
+  // await — the HTTP response returns immediately with the taskId. The
+  // runner pushes events into the task registry's buffer, which any
+  // connected stream subscriber receives live (or replays from a seq).
+  void runChatTask({
+    taskId,
+    message,
+    sessionId,
+    safeCwd,
+    permissionMode,
+    allowedTools,
+    attachments,
+    abortController,
+  });
 
-      // Heartbeat: emit a tiny `{"type":"heartbeat"}` line every 15s while
-      // the SDK is mid-turn. Reasons:
-      //   1. The model itself can think for 30-90s before emitting any
-      //      content — no bytes flow during that time.
-      //   2. canUseTool blocks on the user clicking Allow/Deny — could be
-      //      minutes of total silence.
-      // Without periodic bytes, Traefik / Cloudflare / nginx kill the
-      // connection at their default idle timeouts (~60s), and the frontend
-      // sees it as a "network error". The heartbeat keeps it alive
-      // indefinitely. The frontend parser silently ignores these lines.
-      const HEARTBEAT_MS = 15_000;
-      const heartbeatTimer = setInterval(() => {
-        send({ type: "heartbeat" });
-      }, HEARTBEAT_MS);
+  return c.json({ taskId });
+}
 
-      // Track every pending permission we open so we can auto-deny on
-      // stream abort (otherwise the SDK call hangs forever).
-      const openPermissions = new Set<string>();
+interface RunChatTaskArgs {
+  taskId: string;
+  message: string;
+  sessionId?: string;
+  safeCwd?: string;
+  permissionMode?: ChatRequest["permissionMode"];
+  allowedTools?: string[];
+  attachments?: ChatRequest["attachments"];
+  abortController: AbortController;
+}
 
-      // The structured permission callback. Replaces the regex-based
-      // is_error parsing — SDK calls this for any tool that needs approval
-      // and we surface a permission_request stream event with full context.
-      const canUseTool: CanUseTool = async (toolName, input, options) => {
-        const { id, promise } = createPendingPermission({
-          toolUseId: options.toolUseID,
-          toolName,
-          input,
-        });
-        openPermissions.add(id);
+/**
+ * The background SDK runner. Spawned (not awaited) from handleChatRequest.
+ * Pushes every event into the task registry instead of an HTTP stream —
+ * subscribers attach/detach freely via the chatStream handler and the
+ * task survives between connections.
+ *
+ * Mirrors the original in-handler logic 1:1: image attachments, system-
+ * prompt appendage, token-usage forwarding, permission flow. The only
+ * change is where output bytes go.
+ */
+async function runChatTask(args: RunChatTaskArgs): Promise<void> {
+  const {
+    taskId,
+    message,
+    sessionId,
+    safeCwd,
+    permissionMode,
+    allowedTools,
+    attachments,
+    abortController,
+  } = args;
 
-        const payload: PermissionRequestPayload = {
+  const openPermissions = new Set<string>();
+
+  const canUseTool: CanUseTool = async (toolName, input, options) => {
+    // ───── Absent-mode short-circuit ─────
+    // Once a prior canUseTool in this task hit the 5-min timeout, the
+    // user is presumed away. Auto-allow silently for every subsequent
+    // request — no event pushed, no Promise dance, no UI noise. The
+    // user can still see the tool_use blocks in chat when they come
+    // back; we just skip the modal that would have stalled the task.
+    const taskAtStart = getTask(taskId);
+    if (taskAtStart?.absentMode) {
+      info("canUseTool auto-allowed (absent-mode):", {
+        taskId,
+        toolName,
+        toolUseId: options.toolUseID,
+      });
+      return { behavior: "allow", updatedInput: input };
+    }
+
+    const { id, promise } = createPendingPermission({
+      toolUseId: options.toolUseID,
+      toolName,
+      input,
+    });
+    openPermissions.add(id);
+
+    const payload: PermissionRequestPayload = {
+      id,
+      toolUseId: options.toolUseID,
+      toolName,
+      input,
+      title: options.title,
+      displayName: options.displayName,
+      description: options.description,
+      blockedPath: options.blockedPath,
+      decisionReason: options.decisionReason,
+      suggestions: options.suggestions,
+    };
+    info("SDK canUseTool fired:", {
+      taskId,
+      id,
+      toolName,
+      toolUseId: options.toolUseID,
+      blockedPath: options.blockedPath,
+      decisionReason: options.decisionReason,
+      suggestionCount: options.suggestions?.length ?? 0,
+    });
+    pushEvent(taskId, { type: "permission_request", data: payload });
+
+    // ───── 5-min auto-allow timer ─────
+    // If the user doesn't answer within PERMISSION_WAIT_MS, resolve
+    // the Promise with allow + flip the task into absent-mode so the
+    // REST of the task runs without further prompts. Also push a
+    // `permission_resolved` event so any open frontend modal can
+    // dismiss itself when the user reattaches later.
+    const timeoutHandle = setTimeout(() => {
+      if (!openPermissions.has(id)) return; // already resolved
+      info("canUseTool auto-allow (5-min timeout):", {
+        taskId,
+        id,
+        toolName,
+        toolUseId: options.toolUseID,
+      });
+      setTaskAbsentMode(taskId, true);
+      autoAllowPending(id);
+      openPermissions.delete(id);
+      pushEvent(taskId, {
+        type: "permission_resolved",
+        data: {
           id,
-          toolUseId: options.toolUseID,
-          toolName,
-          input,
-          title: options.title,
-          displayName: options.displayName,
-          description: options.description,
-          blockedPath: options.blockedPath,
-          decisionReason: options.decisionReason,
-          suggestions: options.suggestions,
-        };
-        info("SDK canUseTool fired:", {
-          requestId,
-          id,
-          toolName,
-          toolUseId: options.toolUseID,
-          blockedPath: options.blockedPath,
-          decisionReason: options.decisionReason,
-          suggestionCount: options.suggestions?.length ?? 0,
-        });
-        send({ type: "permission_request", data: payload });
+          decision: "auto-allow",
+          reason: "user-absent-timeout",
+        },
+      });
+    }, PERMISSION_WAIT_MS);
 
-        // If the SDK signals abort while we're waiting on the user, deny.
-        const onAbort = () => {
-          if (denyPending(id, "Aborted by user")) {
-            openPermissions.delete(id);
-          }
-        };
-        options.signal.addEventListener("abort", onAbort, { once: true });
-        try {
-          const result = await promise;
-          openPermissions.delete(id);
-          return result;
-        } finally {
-          options.signal.removeEventListener("abort", onAbort);
-        }
-      };
+    const onAbort = () => {
+      if (denyPending(id, "Aborted by user")) {
+        openPermissions.delete(id);
+      }
+      clearTimeout(timeoutHandle);
+    };
+    options.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      const result = await promise;
+      openPermissions.delete(id);
+      return result;
+    } finally {
+      clearTimeout(timeoutHandle);
+      options.signal.removeEventListener("abort", onAbort);
+    }
+  };
 
-      try {
-        const claudePath = process.env.CLAUDE_PATH;
-        // Always make AI-IDE skills available; merge with any caller-allowed tools.
-        const mergedAllowedTools = [
-          ...MCP_TOOL_NAMES,
-          ...(allowedTools ?? []),
-        ];
-        info("Invoking SDK query:", {
-          requestId,
-          mergedAllowedTools,
-          resume: sessionId ?? null,
-          isContinue,
-        });
-        // When the user sends images, hand them to Claude as proper
-        // multimodal content blocks (base64 image sources). The default
-        // string prompt would only carry the text — Claude would see
-        // filenames like "annotation-12345.png" and try to Read them off
-        // disk, which fails ("File does not exist").
-        const promptInput =
-          attachments && attachments.length > 0
-            ? (async function* () {
-                yield {
-                  type: "user" as const,
-                  parent_tool_use_id: null,
-                  message: {
-                    role: "user" as const,
-                    content: [
-                      { type: "text" as const, text: message },
-                      ...attachments.map((a) => ({
-                        type: "image" as const,
-                        source: {
-                          type: "base64" as const,
-                          media_type: a.mediaType as
-                            | "image/png"
-                            | "image/jpeg"
-                            | "image/gif"
-                            | "image/webp",
-                          data: a.base64,
-                        },
-                      })),
-                    ],
-                  },
-                  // Required field on SDKUserMessage even though we don't
-                  // have a session — the SDK fills this in when streaming.
-                  session_id: sessionId ?? "",
-                };
-              })()
-            : message;
-        const proxyContext = buildProxyContext();
-        const completionContext = buildCompletionVerificationContext();
-        const playwrightContext = buildPlaywrightContext();
-        const hyperframesContext = buildHyperframesContext();
-        const persistenceContext = buildPersistenceContext();
-        const codeOrgContext = buildCodeOrganizationContext();
-        // Combine the workspace-environment contexts into one
-        // appendSystemPrompt blob. The model sees them as additional
-        // sections after the Claude Agent SDK's own prompt:
-        //   1. proxyContext       — URLs / ports / CORS / iframe rules
-        //   2. completionContext  — broad verification suite (type-check,
-        //                           lint, unit, build) before "done"
-        //   3. playwrightContext  — E2E testing default rule (UI changes)
-        //   4. hyperframesContext — HTML→MP4 video gen
-        //   5. persistenceContext — tmux/recipes for long-running processes
-        //                           (so dev servers survive browser-close
-        //                           and EC2 reboots)
-        //   6. codeOrgContext     — production-grade folder structure /
-        //                           one component per file / README rules
-        //                           for any new scaffolding (so exports
-        //                           are handoff-ready)
-        const appendedSystem = [
-          proxyContext,
-          completionContext,
-          playwrightContext,
-          hyperframesContext,
-          persistenceContext,
-          codeOrgContext,
-        ]
-          .filter((s): s is string => Boolean(s))
-          .join("\n\n");
-        const response = query({
-          prompt: promptInput,
-          options: {
-            abortController,
-            ...(sessionId ? { resume: sessionId } : {}),
-            ...(claudePath ? { pathToClaudeCodeExecutable: claudePath } : {}),
-            ...(safeCwd ? { cwd: safeCwd } : {}),
-            allowedTools: mergedAllowedTools,
-            disallowedTools: DISALLOWED_TOOLS,
-            mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
-            canUseTool,
-            ...(permissionMode ? { permissionMode } : {}),
-            ...(appendedSystem ? { appendSystemPrompt: appendedSystem } : {}),
-          },
-        });
+  try {
+    const claudePath = process.env.CLAUDE_PATH;
+    const mergedAllowedTools = [
+      ...MCP_TOOL_NAMES,
+      ...(allowedTools ?? []),
+    ];
+    info("Invoking SDK query:", {
+      taskId,
+      mergedAllowedTools,
+      resume: sessionId ?? null,
+    });
 
-        let detectedSessionId: string | null = sessionId ?? null;
-        let messageCount = 0;
-        for await (const sdkMessage of response) {
-          send({ type: "claude_json", data: sdkMessage });
-          const msg = sdkMessage as unknown as {
-            session_id?: string;
-            type?: string;
-            message?: { content?: Array<Record<string, unknown>> };
-          };
-          if (msg.session_id) detectedSessionId = msg.session_id;
-          if (msg.type === "assistant" || msg.type === "user") messageCount++;
-          // Authoritative auto-deny signal from the SDK.
-          if (msg.type === "system") {
-            const sysMsg = sdkMessage as unknown as {
-              subtype?: string;
-              tool_name?: string;
-              tool_use_id?: string;
-              decision_reason?: string;
-              decision_reason_type?: string;
-              message?: string;
+    const promptInput =
+      attachments && attachments.length > 0
+        ? (async function* () {
+            yield {
+              type: "user" as const,
+              parent_tool_use_id: null,
+              message: {
+                role: "user" as const,
+                content: [
+                  { type: "text" as const, text: message },
+                  ...attachments.map((a) => ({
+                    type: "image" as const,
+                    source: {
+                      type: "base64" as const,
+                      media_type: a.mediaType as
+                        | "image/png"
+                        | "image/jpeg"
+                        | "image/gif"
+                        | "image/webp",
+                      data: a.base64,
+                    },
+                  })),
+                ],
+              },
+              session_id: sessionId ?? "",
             };
-            if (sysMsg.subtype === "permission_denied") {
-              warn("SDK permission_denied:", {
-                requestId,
-                tool: sysMsg.tool_name,
-                tool_use_id: sysMsg.tool_use_id,
-                reasonType: sysMsg.decision_reason_type,
-                reason: sysMsg.decision_reason,
-                message: sysMsg.message,
+          })()
+        : message;
+
+    const proxyContext = buildProxyContext();
+    const completionContext = buildCompletionVerificationContext();
+    const playwrightContext = buildPlaywrightContext();
+    const hyperframesContext = buildHyperframesContext();
+    const persistenceContext = buildPersistenceContext();
+    const codeOrgContext = buildCodeOrganizationContext();
+    const appendedSystem = [
+      proxyContext,
+      completionContext,
+      playwrightContext,
+      hyperframesContext,
+      persistenceContext,
+      codeOrgContext,
+    ]
+      .filter((s): s is string => Boolean(s))
+      .join("\n\n");
+
+    const response = query({
+      prompt: promptInput,
+      options: {
+        abortController,
+        ...(sessionId ? { resume: sessionId } : {}),
+        ...(claudePath ? { pathToClaudeCodeExecutable: claudePath } : {}),
+        ...(safeCwd ? { cwd: safeCwd } : {}),
+        allowedTools: mergedAllowedTools,
+        disallowedTools: DISALLOWED_TOOLS,
+        mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
+        canUseTool,
+        ...(permissionMode ? { permissionMode } : {}),
+        ...(appendedSystem ? { appendSystemPrompt: appendedSystem } : {}),
+        includePartialMessages: true,
+        settings: { autoCompactEnabled: false },
+      },
+    });
+
+    let detectedSessionId: string | null = sessionId ?? null;
+    let messageCount = 0;
+    for await (const sdkMessage of response) {
+      pushEvent(taskId, { type: "claude_json", data: sdkMessage });
+      const msg = sdkMessage as unknown as {
+        session_id?: string;
+        type?: string;
+        message?: { content?: Array<Record<string, unknown>>; usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } };
+        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+      };
+      if (msg.session_id) {
+        detectedSessionId = msg.session_id;
+        setTaskSessionId(taskId, msg.session_id);
+      }
+      if (msg.type === "assistant" || msg.type === "user") messageCount++;
+
+      const usage = msg.usage ?? msg.message?.usage;
+      if (usage) {
+        const inputTokens = usage.input_tokens ?? 0;
+        const cacheRead = usage.cache_read_input_tokens ?? 0;
+        const cacheCreate = usage.cache_creation_input_tokens ?? 0;
+        const totalIn = inputTokens + cacheRead + cacheCreate;
+        pushEvent(taskId, {
+          type: "token_usage",
+          data: { inputTokens: totalIn, outputTokens: usage.output_tokens ?? 0 },
+        });
+      }
+      if (msg.type === "system") {
+        const sysMsg = sdkMessage as unknown as {
+          subtype?: string;
+          tool_name?: string;
+          tool_use_id?: string;
+          decision_reason?: string;
+          decision_reason_type?: string;
+          message?: string;
+        };
+        if (sysMsg.subtype === "permission_denied") {
+          warn("SDK permission_denied:", {
+            taskId,
+            tool: sysMsg.tool_name,
+            tool_use_id: sysMsg.tool_use_id,
+            reasonType: sysMsg.decision_reason_type,
+            reason: sysMsg.decision_reason,
+            message: sysMsg.message,
+          });
+        }
+      }
+      const content = msg.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          const t = block.type as string | undefined;
+          if (t === "tool_use") {
+            info("SDK tool_use:", {
+              taskId,
+              name: block.name,
+              id: block.id,
+              input: block.input,
+            });
+            if (block.name === "AskUserQuestion") {
+              const qs =
+                (block.input as { questions?: Array<{ header?: string; question?: string }> })
+                  ?.questions ?? [];
+              info("SDK AskUserQuestion detected:", {
+                taskId,
+                tool_use_id: block.id,
+                questionCount: qs.length,
+                headers: qs.map((q) => q.header),
+                note: "Frontend modal will intercept; this SDK call will auto-error and be suppressed.",
+              });
+            }
+          } else if (t === "tool_result") {
+            const isErr = (block.is_error as boolean) ?? false;
+            let txt = "";
+            if (typeof block.content === "string") {
+              txt = block.content;
+            } else if (Array.isArray(block.content)) {
+              txt = (block.content as Array<Record<string, unknown>>)
+                .map((c) => (typeof c === "string" ? c : ((c?.text as string) ?? "")))
+                .filter(Boolean)
+                .join("\n");
+            }
+            if (isErr) {
+              warn("SDK tool_result ERROR:", {
+                taskId,
+                tool_use_id: block.tool_use_id,
+                text: txt.slice(0, 500),
+                rawBlock: JSON.stringify(block).slice(0, 2000),
+              });
+            } else {
+              info("SDK tool_result ok:", {
+                taskId,
+                tool_use_id: block.tool_use_id,
               });
             }
           }
-          // Log every tool call + tool result so the backend console shows the
-          // exact SDK signal that lead to a permission UI / error in the chat.
-          const content = msg.message?.content;
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              const t = block.type as string | undefined;
-              if (t === "tool_use") {
-                info("SDK tool_use:", {
-                  requestId,
-                  name: block.name,
-                  id: block.id,
-                  input: block.input,
-                });
-                // Extra-loud log for AskUserQuestion so it's easy to spot in
-                // the backend terminal when debugging the modal flow.
-                if (block.name === "AskUserQuestion") {
-                  const qs =
-                    (block.input as { questions?: Array<{ header?: string; question?: string }> })
-                      ?.questions ?? [];
-                  info("SDK AskUserQuestion detected:", {
-                    requestId,
-                    tool_use_id: block.id,
-                    questionCount: qs.length,
-                    headers: qs.map((q) => q.header),
-                    note: "Frontend modal will intercept; this SDK call will auto-error and be suppressed.",
-                  });
-                }
-              } else if (t === "tool_result") {
-                const isErr = (block.is_error as boolean) ?? false;
-                let txt = "";
-                if (typeof block.content === "string") {
-                  txt = block.content;
-                } else if (Array.isArray(block.content)) {
-                  txt = (block.content as Array<Record<string, unknown>>)
-                    .map((c) => (typeof c === "string" ? c : ((c?.text as string) ?? "")))
-                    .filter(Boolean)
-                    .join("\n");
-                }
-                if (isErr) {
-                  warn("SDK tool_result ERROR:", {
-                    requestId,
-                    tool_use_id: block.tool_use_id,
-                    text: txt.slice(0, 500),
-                    // Dump the full raw block so empty-body denials are
-                    // visible (text/content-shape is hard to infer otherwise).
-                    rawBlock: JSON.stringify(block).slice(0, 2000),
-                  });
-                } else {
-                  info("SDK tool_result ok:", {
-                    requestId,
-                    tool_use_id: block.tool_use_id,
-                  });
-                }
-              }
-            }
-          }
-        }
-
-        // Persist session metadata after stream completes
-        if (detectedSessionId) {
-          try { recordSession(detectedSessionId, safeCwd ?? null, messageCount); } catch { /* ignore */ }
-        }
-
-        send({ type: "done" });
-      } catch (err: unknown) {
-        if (err instanceof Error && err.name === "AbortError") {
-          send({ type: "aborted" });
-        } else {
-          const msg = err instanceof Error ? err.message : String(err);
-          logError("Chat error:", msg);
-          send({ type: "error", error: msg });
-        }
-      } finally {
-        // Stop the heartbeat BEFORE closing the controller — otherwise a
-        // straggling tick can fire between close() and the timer being
-        // cleared, and call enqueue() on a closed stream.
-        clearInterval(heartbeatTimer);
-        abortControllers.delete(requestId);
-        // Drain any permission prompts that were never answered (otherwise
-        // their pending entries leak across requests).
-        for (const id of openPermissions) {
-          denyPending(id, "Stream ended without a decision");
-        }
-        openPermissions.clear();
-        closed = true;
-        try {
-          controller.close();
-        } catch {
-          // Already closed by upstream — nothing to do.
         }
       }
-    },
-  });
+    }
 
-  return c.newResponse(stream, {
-    headers: {
-      "Content-Type": "application/x-ndjson",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-    },
-  });
+    if (detectedSessionId) {
+      try { recordSession(detectedSessionId, safeCwd ?? null, messageCount); } catch { /* ignore */ }
+    }
+
+    pushEvent(taskId, { type: "done" });
+    setTaskStatus(taskId, "done");
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
+      pushEvent(taskId, { type: "aborted" });
+      setTaskStatus(taskId, "aborted");
+    } else {
+      const msgText = err instanceof Error ? err.message : String(err);
+      logError("Chat task error:", msgText);
+      pushEvent(taskId, { type: "error", error: msgText });
+      setTaskStatus(taskId, "error");
+    }
+  } finally {
+    for (const id of openPermissions) {
+      denyPending(id, "Task ended without a decision");
+    }
+    openPermissions.clear();
+  }
 }
 
 export async function handleAbortRequest(c: Context) {

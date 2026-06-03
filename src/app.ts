@@ -1,6 +1,10 @@
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { handleChatRequest, handleAbortRequest } from "./handlers/chat.js";
+import {
+  handleChatStreamRequest,
+  handleActiveTasksRequest,
+} from "./handlers/chatStream.js";
 import { handleProjectsRequest } from "./handlers/projects.js";
 import { handleHistoriesRequest } from "./handlers/histories.js";
 import { handleConversationRequest } from "./handlers/conversations.js";
@@ -63,6 +67,8 @@ export function createApp(config: AppConfig) {
   );
 
   app.post("/api/chat", handleChatRequest);
+  app.get("/api/chat/stream/:taskId", handleChatStreamRequest);
+  app.get("/api/chat/active", handleActiveTasksRequest);
   app.post("/api/abort/:requestId", handleAbortRequest);
   app.get("/api/projects", handleProjectsRequest);
   app.get("/api/projects/:encodedProjectName/histories", handleHistoriesRequest);

@@ -119,7 +119,23 @@ async function handleConnection(
     }
   });
 
+  // Heartbeat: most edge proxies (Traefik default, nginx default,
+  // Cloudflare 100s) drop idle WebSockets after ~60s, which is what
+  // surfaced as the random "[connection closed]" mid-session bug.
+  // A 25s server ping keeps the upstream alive without spamming.
+  // The browser auto-responds to ping with pong — no client wiring
+  // needed beyond reading the frame.
+  const pingInterval: NodeJS.Timeout = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) return;
+    try {
+      ws.ping();
+    } catch {
+      // socket lost — the close handler will run shortly
+    }
+  }, 25_000);
+
   const cleanup = (): void => {
+    clearInterval(pingInterval);
     try {
       pty.kill();
     } catch {

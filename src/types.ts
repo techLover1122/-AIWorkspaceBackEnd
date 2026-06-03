@@ -12,6 +12,16 @@ export interface StreamResponse {
     | "done"
     | "aborted"
     | "permission_request"
+    // Companion to `permission_request`: pushed when a pending permission
+    // is resolved server-side WITHOUT a user decision (5-min auto-allow
+    // timeout, future task-aborts, etc.). Frontend uses this to close
+    // any stale modal that was opened by the original `permission_request`
+    // — the SDK has already moved on. data: { id, decision, reason }.
+    | "permission_resolved"
+    // Live token-usage update for the chat header's CompactRing — emitted
+    // whenever the SDK reports a new usage block (assistant turn or final
+    // result). `data` shape: { inputTokens, outputTokens }.
+    | "token_usage"
     // Emitted every ~15s while the SDK is busy (model thinking) or waiting
     // on a permission decision. Pure side-effect: keeps the HTTP stream
     // alive past proxy idle timeouts (Traefik / Cloudflare / nginx all
