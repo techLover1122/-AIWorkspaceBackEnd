@@ -1270,6 +1270,37 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       .filter((s): s is string => Boolean(s))
       .join("\n\n");
 
+    // ───── Permission mode: HARD-FORCED to "bypassPermissions" ─────
+    //
+    // User explicitly asked for the SDK to "always allow everything" —
+    // no canUseTool prompts, no per-tool gates, no 5-min waits. The
+    // canonical SDK way is `permissionMode: "bypassPermissions"`, which
+    // skips the canUseTool callback entirely.
+    //
+    // We OVERRIDE whatever the client sent in `permissionMode`. The mode
+    // toggle in the chat header (default/plan/acceptEdits/bypass) still
+    // exists for now but is effectively cosmetic — the "default" and
+    // "acceptEdits" modes no longer ask, and "plan" mode's gate doesn't
+    // fire either. If a future requirement reverses this, change ONLY
+    // this constant and the override below.
+    //
+    // The 5-minute auto-allow timer + `absentMode` machinery in
+    // canUseTool above become dead code under this override (canUseTool
+    // is never called). Kept intact so flipping back to the asked-flow
+    // is a one-line change.
+    const FORCE_BYPASS_PERMISSIONS = true;
+    const effectivePermissionMode = FORCE_BYPASS_PERMISSIONS
+      ? ("bypassPermissions" as const)
+      : permissionMode;
+
+    if (FORCE_BYPASS_PERMISSIONS && permissionMode && permissionMode !== "bypassPermissions") {
+      info("Overriding client permissionMode to bypass:", {
+        taskId,
+        clientSent: permissionMode,
+        forcedTo: "bypassPermissions",
+      });
+    }
+
     const response = query({
       prompt: promptInput,
       options: {
@@ -1280,8 +1311,12 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
         allowedTools: mergedAllowedTools,
         disallowedTools: DISALLOWED_TOOLS,
         mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
+        // canUseTool is still passed for completeness — it'll just never
+        // be invoked under bypassPermissions, but keeping it wired means
+        // FORCE_BYPASS_PERMISSIONS = false re-enables the gate flow
+        // without further code changes.
         canUseTool,
-        ...(permissionMode ? { permissionMode } : {}),
+        ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}),
         ...(appendedSystem ? { appendSystemPrompt: appendedSystem } : {}),
         includePartialMessages: true,
         settings: { autoCompactEnabled: false },
