@@ -774,6 +774,157 @@ function buildPersistenceContext(): string {
   ].join("\n");
 }
 
+/**
+ * Code organization context — when the model is asked to build a website,
+ * an app, or any new project from scratch, it MUST produce export-ready
+ * code: industry-standard folder structure, one component per file,
+ * proper naming, and a README. The user plans to hand the exported code
+ * off to a developer, so a single mega-file dump is unacceptable even
+ * if it "works".
+ *
+ * This is purely additive — it doesn't override the verification context,
+ * the Playwright context, or any other behavior. It just sets the bar
+ * for HOW code is organized when the model writes it.
+ */
+function buildCodeOrganizationContext(): string {
+  return [
+    "# Code organization — production-grade structure (DEFAULT, not opt-in)",
+    "",
+    "When the user asks you to build a new project, page, feature, or",
+    "scaffold of any kind (e.g. \"build me a landing page\", \"make a",
+    "dashboard\", \"create a website using this env pack\"), you MUST",
+    "produce code that is **export-ready** — meaning the user can zip the",
+    "project, hand it to a developer they hired, and that developer can",
+    "open it and understand what's where without asking questions.",
+    "",
+    "This is the default. Apply it even when the user did not explicitly",
+    "ask for \"clean code\" or \"proper structure\". A single-file demo dump",
+    "is the wrong answer unless the user explicitly asked for a one-file",
+    "throwaway.",
+    "",
+    "## Step 1 — pick the right framework",
+    "",
+    "If an environment pack is installed and recommends a stack, USE THAT",
+    "stack — don't substitute. Otherwise, pick the smallest sensible",
+    "framework for what the user asked for:",
+    "",
+    "| User asked for                | Use                              |",
+    "| ----------------------------- | -------------------------------- |",
+    "| Marketing / landing page      | Next.js (App Router) + Tailwind  |",
+    "| Dashboard / app with auth     | Next.js (App Router) + Tailwind  |",
+    "| Static brochure / portfolio   | Astro or Next.js static export   |",
+    "| Backend API                   | Node + Hono (or Express)         |",
+    "| Full-stack CRUD               | Next.js with API routes          |",
+    "| CLI tool                      | Node + TypeScript + commander    |",
+    "",
+    "Confirm framework once with the user only if the request is genuinely",
+    "ambiguous (e.g. \"build me an app\" with no other context). Otherwise",
+    "pick and proceed.",
+    "",
+    "## Step 2 — scaffold a real project, not loose files",
+    "",
+    "Every new project gets, at minimum:",
+    "",
+    "- A proper `package.json` with `name`, `scripts` (`dev`, `build`,",
+    "  `start`, `lint`, `typecheck`), and pinned-or-caret-ranged deps.",
+    "- A `tsconfig.json` with `strict: true` for TypeScript projects.",
+    "- A `.gitignore` that excludes `node_modules/`, `.next/`, `dist/`,",
+    "  `.env`, `.env.local`, IDE cruft (`.vscode/`, `.idea/`).",
+    "- A `README.md` with: one-line description, prerequisites,",
+    "  `npm install` + `npm run dev` quick start, folder map, env-var list",
+    "  if any.",
+    "- An `.env.example` (NOT `.env`) if the project needs any secrets.",
+    "- A linter config (`eslint.config.js` or equivalent) and a",
+    "  formatter config (`.prettierrc`) for non-trivial projects.",
+    "",
+    "## Step 3 — folder layout",
+    "",
+    "### Next.js (App Router) — the default for web work",
+    "",
+    "```",
+    "src/",
+    "├── app/                    # routes only — page.tsx, layout.tsx, loading.tsx",
+    "│   ├── (marketing)/        # route groups for shared layouts",
+    "│   │   ├── layout.tsx",
+    "│   │   └── page.tsx",
+    "│   └── dashboard/",
+    "│       └── page.tsx",
+    "├── components/             # reusable UI — ONE component per file",
+    "│   ├── ui/                 # primitives (Button, Input, Card)",
+    "│   └── sections/           # composite blocks (Hero, Pricing, Footer)",
+    "├── hooks/                  # useXxx() — one hook per file",
+    "├── lib/                    # framework-agnostic helpers (db client,",
+    "│                           # auth client, fetcher, env validation)",
+    "├── utils/                  # pure functions (formatDate, cn, slugify)",
+    "├── types/                  # shared TypeScript types/interfaces",
+    "├── constants/              # enums, route maps, copy strings",
+    "└── styles/                 # globals.css, tailwind base layers",
+    "public/                     # static assets — images, fonts, favicons",
+    "```",
+    "",
+    "### React (Vite) SPA",
+    "",
+    "Same as Next.js minus `app/`. Use `src/pages/` or `src/routes/` for",
+    "route components and a router config in `src/lib/router.tsx`.",
+    "",
+    "### Node / Hono / Express backend",
+    "",
+    "```",
+    "src/",
+    "├── index.ts                # server bootstrap only",
+    "├── routes/                 # one file per resource (users.ts, posts.ts)",
+    "├── handlers/               # request handlers, called by routes",
+    "├── services/               # business logic, no HTTP knowledge",
+    "├── db/                     # client + schema + migrations",
+    "├── middleware/             # auth, logging, CORS, rate-limit",
+    "├── types/                  # shared types",
+    "└── utils/                  # pure helpers",
+    "```",
+    "",
+    "## Step 4 — file-level rules",
+    "",
+    "1. **One component per file.** `Hero.tsx` exports `Hero`. Not three",
+    "   components in one file. Sub-components used only by `Hero` can",
+    "   live in the same file IF they're trivial; otherwise split.",
+    "2. **Name files after what they export.** PascalCase for components",
+    "   (`Hero.tsx`), camelCase for hooks/utils (`useAuth.ts`,",
+    "   `formatDate.ts`), kebab-case for route segments and config",
+    "   (`page.tsx`, `next.config.mjs`).",
+    "3. **Keep files under ~250 lines.** If a component is longer, you're",
+    "   missing a sub-component or a hook. Extract.",
+    "4. **No inline logic dumps.** Data fetching → hook or server",
+    "   function. Validation → util or zod schema. Styling → Tailwind",
+    "   classes or a co-located `.module.css`.",
+    "5. **Types co-located OR in `types/`.** Prop types in the same file",
+    "   as the component (`type HeroProps = ...`). Cross-cutting domain",
+    "   types in `src/types/` (e.g. `User`, `Product`).",
+    "6. **No magic strings.** Repeated copy → `constants/`. Repeated route",
+    "   paths → `constants/routes.ts`.",
+    "7. **No hardcoded secrets.** Env vars go through a validated",
+    "   `src/lib/env.ts` (zod-validated) and are loaded from `.env.local`.",
+    "",
+    "## Step 5 — what NOT to do",
+    "",
+    "- Don't dump everything into `App.tsx` or `page.tsx`.",
+    "- Don't create a 600-line component because \"it works\".",
+    "- Don't skip the README — the export is half-broken without it.",
+    "- Don't commit `node_modules/` or `.env` — gitignore them up front.",
+    "- Don't invent a folder structure that doesn't match the framework's",
+    "  conventions. The developer receiving this code expects Next.js to",
+    "  look like Next.js.",
+    "- Don't ask the user \"should I split this into components?\" — the",
+    "  answer is always yes for anything non-trivial. Just do it.",
+    "",
+    "## Step 6 — when the user is iterating on an existing project",
+    "",
+    "If the project already exists (you're adding a feature, not",
+    "scaffolding from scratch), MATCH the existing structure even if it's",
+    "not what you'd pick fresh. Don't \"clean up\" unrelated files. The",
+    "rules above apply to NEW files and NEW projects; for existing ones,",
+    "respect the conventions already in the repo.",
+  ].join("\n");
+}
+
 // Tools whose response path we don't wire through our frontend. Populate as
 // new ones surface. AskUserQuestion now has a custom modal handler in the
 // frontend that intercepts the tool_use block, shows a popup, and sends the
@@ -962,7 +1113,8 @@ export async function handleChatRequest(c: Context) {
         const playwrightContext = buildPlaywrightContext();
         const hyperframesContext = buildHyperframesContext();
         const persistenceContext = buildPersistenceContext();
-        // Combine the five workspace-environment contexts into one
+        const codeOrgContext = buildCodeOrganizationContext();
+        // Combine the workspace-environment contexts into one
         // appendSystemPrompt blob. The model sees them as additional
         // sections after the Claude Agent SDK's own prompt:
         //   1. proxyContext       — URLs / ports / CORS / iframe rules
@@ -973,12 +1125,17 @@ export async function handleChatRequest(c: Context) {
         //   5. persistenceContext — tmux/recipes for long-running processes
         //                           (so dev servers survive browser-close
         //                           and EC2 reboots)
+        //   6. codeOrgContext     — production-grade folder structure /
+        //                           one component per file / README rules
+        //                           for any new scaffolding (so exports
+        //                           are handoff-ready)
         const appendedSystem = [
           proxyContext,
           completionContext,
           playwrightContext,
           hyperframesContext,
           persistenceContext,
+          codeOrgContext,
         ]
           .filter((s): s is string => Boolean(s))
           .join("\n\n");
