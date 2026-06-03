@@ -1,6 +1,8 @@
 import "dotenv/config";
 import { serve } from "@hono/node-server";
+import type { Server as HttpServer } from "node:http";
 import { createApp } from "./app.js";
+import { attachTerminalWebSocket } from "./handlers/terminal.js";
 import { info } from "./utils/logger.js";
 import { warmStartClaudeCli } from "./utils/claudeCli.js";
 
@@ -16,7 +18,7 @@ async function main() {
 
   const app = createApp({ port, host, debug, claudePath: detected });
 
-  serve(
+  const server = serve(
     {
       fetch: app.fetch,
       port,
@@ -27,6 +29,11 @@ async function main() {
       info(`Debug mode: ${debug}`);
     }
   );
+
+  // Attach the terminal WebSocket route to the underlying HTTP server.
+  // Hono itself only handles fetch-style HTTP — we hook `upgrade`
+  // directly on the node server for the PTY bridge.
+  attachTerminalWebSocket(server as unknown as HttpServer);
 }
 
 main().catch((err) => {
