@@ -57,6 +57,49 @@ const MCP_TOOL_NAMES = [
   "mcp__aiide__create_pack",
 ];
 
+// Phase 4 — Playwright MCP wired through to the desktop app.
+//
+// When PLAYWRIGHT_MCP_URL is set (typically pointing at a reverse-SSH-
+// tunneled `http://127.0.0.1:9090/` on this EC2, with the desktop
+// providing the upstream end), every Playwright MCP tool exposed by
+// @playwright/mcp becomes callable from the chat panel. Currently 43
+// tools — listing them all so the SDK's allow-list whitelist matches
+// each one explicitly.
+const PLAYWRIGHT_MCP_URL = process.env.PLAYWRIGHT_MCP_URL ?? null;
+const PLAYWRIGHT_TOOL_NAMES = PLAYWRIGHT_MCP_URL ? [
+  // core — page interaction primitives
+  "mcp__playwright__browser_snapshot",
+  "mcp__playwright__browser_click",
+  "mcp__playwright__browser_drag",
+  "mcp__playwright__browser_hover",
+  "mcp__playwright__browser_select_option",
+  "mcp__playwright__browser_type",
+  "mcp__playwright__browser_press_key",
+  "mcp__playwright__browser_handle_dialog",
+  "mcp__playwright__browser_take_screenshot",
+  "mcp__playwright__browser_file_upload",
+  "mcp__playwright__browser_close",
+  "mcp__playwright__browser_resize",
+  "mcp__playwright__browser_wait_for",
+  "mcp__playwright__browser_evaluate",
+  "mcp__playwright__browser_navigate",
+  "mcp__playwright__browser_navigate_back",
+  "mcp__playwright__browser_console_messages",
+  "mcp__playwright__browser_network_requests",
+  // core-tabs
+  "mcp__playwright__browser_tabs",
+  // vision — coordinate-based interactions
+  "mcp__playwright__browser_mouse_click_xy",
+  "mcp__playwright__browser_mouse_drag_xy",
+  "mcp__playwright__browser_mouse_move_xy",
+  // pdf
+  "mcp__playwright__browser_pdf_save",
+  // network
+  "mcp__playwright__browser_network_capture",
+  // devtools
+  "mcp__playwright__browser_devtools_console",
+] : [];
+
 /**
  * Workspace-environment context appended to every chat request's system
  * prompt. Without this the model treats the box as a normal Linux VM and
@@ -1277,6 +1320,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     const claudePath = process.env.CLAUDE_PATH;
     const mergedAllowedTools = [
       ...MCP_TOOL_NAMES,
+      ...PLAYWRIGHT_TOOL_NAMES,
       ...(allowedTools ?? []),
     ];
     info("Invoking SDK query:", {
@@ -1379,7 +1423,16 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
         ...(safeCwd ? { cwd: safeCwd } : {}),
         allowedTools: mergedAllowedTools,
         disallowedTools: DISALLOWED_TOOLS,
-        mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
+        mcpServers: {
+          aiide: createAiideMcpServer({ workspaceDir: safeCwd }),
+          // Phase 4 — Playwright MCP via the reverse SSH tunnel to the
+          // user's desktop app. `alwaysLoad` forces the tools into the
+          // turn-1 prompt instead of being deferred behind tool search,
+          // so the model sees them immediately without an extra step.
+          ...(PLAYWRIGHT_MCP_URL
+            ? { playwright: { type: "http" as const, url: PLAYWRIGHT_MCP_URL, alwaysLoad: true } }
+            : {}),
+        },
         // canUseTool is still passed for completeness — it'll just never
         // be invoked under bypassPermissions, but keeping it wired means
         // FORCE_BYPASS_PERMISSIONS = false re-enables the gate flow
