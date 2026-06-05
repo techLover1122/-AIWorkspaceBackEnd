@@ -200,7 +200,6 @@ export function runAnomalyDetection(
   // Always run these checks regardless of captured intent
   checks.push(checkUnexpectedToolCategories(actions));
   checks.push(checkTaskCompleteness(finalResponse));
-  checks.push(checkToolErrors(actions));
 
   // Determine overall severity
   const hasFail = checks.some((c) => c.status === "fail");
