@@ -24,6 +24,7 @@
 import type { Context } from "hono";
 import {
   handleIncomingMessage,
+  invalidateWhatsAppLinkCache,
   isWhatsAppConfigured,
   sidecarPairPhone,
   sidecarQr,
@@ -31,6 +32,10 @@ import {
   sidecarStatus,
   sidecarUnlink,
 } from "../utils/whatsappBridge.js";
+import {
+  getWhatsAppForwardingEnabled,
+  setWhatsAppForwardingEnabled,
+} from "../utils/userPrefs.js";
 import { info, warn } from "../utils/logger.js";
 
 const AUTH_TOKEN = process.env.WHATSAPP_AUTH_TOKEN ?? "";
@@ -127,6 +132,7 @@ export async function handleWhatsAppUnlink(c: Context) {
   if (!isWhatsAppConfigured()) return notConfigured(c);
   try {
     const data = await sidecarUnlink();
+    invalidateWhatsAppLinkCache();
     return c.json(data);
   } catch (err) {
     warn("WhatsApp unlink failed:", {
@@ -134,6 +140,35 @@ export async function handleWhatsAppUnlink(c: Context) {
     });
     return c.json({ error: "Sidecar unreachable" }, 502);
   }
+}
+
+/**
+ * GET /api/whatsapp/forwarding
+ *
+ * Returns the per-workspace "always forward to WhatsApp" toggle. When
+ * true, attention-events fire WhatsApp notifies on every event
+ * regardless of presence or idle timers (trigger #1 of the three).
+ * Stored in SQLite, lost on EC2 rebuild from snapshot.
+ */
+export function handleWhatsAppGetForwarding(c: Context) {
+  return c.json({ enabled: getWhatsAppForwardingEnabled() });
+}
+
+/**
+ * POST /api/whatsapp/forwarding  body: { enabled: boolean }
+ */
+export async function handleWhatsAppSetForwarding(c: Context) {
+  let body: { enabled?: unknown };
+  try {
+    body = (await c.req.json()) as { enabled?: unknown };
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  if (typeof body.enabled !== "boolean") {
+    return c.json({ error: "enabled must be a boolean" }, 400);
+  }
+  setWhatsAppForwardingEnabled(body.enabled);
+  return c.json({ enabled: body.enabled });
 }
 
 /**

@@ -8,6 +8,7 @@ import {
   type BufferedEvent,
 } from "../utils/taskRegistry.js";
 import { isPending } from "./permission.js";
+import { notifyStreamOpen, notifyStreamClose } from "../utils/presenceTracker.js";
 
 /**
  * GET /api/chat/stream/:taskId?from=<seq>
@@ -42,6 +43,13 @@ export async function handleChatStreamRequest(c: Context) {
     subscribers: task.subscribers.size,
   });
 
+  // Presence tracking — incremented on stream open, decremented on the
+  // FIRST of (cancel from client disconnect, cleanup from terminal event,
+  // cleanup from enqueue error). Shared between start() and cancel() so
+  // tab-close flips the user to absent immediately.
+  notifyStreamOpen();
+  const decrementPresence = notifyStreamClose();
+
   const stream = new ReadableStream({
     async start(controller) {
       // Shared close state — `cleanup` is the single path that ends this
@@ -62,6 +70,7 @@ export async function handleChatStreamRequest(c: Context) {
           unsubscribe();
           unsubscribe = null;
         }
+        decrementPresence();
         try {
           controller.close();
         } catch {
@@ -157,12 +166,12 @@ export async function handleChatStreamRequest(c: Context) {
       }
     },
     cancel() {
-      // Client disconnected. The `cleanup` closure inside `start` is
-      // unreachable from here, but the broken `controller.enqueue` on
-      // next event will trigger cleanup() via the catch branch above.
-      // The heartbeat tick (every 15s) will also catch the closed
-      // controller and self-clean. In the worst case the timer fires
-      // once or twice before the next tick — harmless.
+      // Client disconnected — flip presence to absent immediately so
+      // WhatsApp routing can take over without waiting for the next
+      // heartbeat. The full cleanup (unsubscribe, timer clear) still
+      // happens lazily via the broken-enqueue path or heartbeat tick,
+      // but presence is the time-sensitive bit.
+      decrementPresence();
     },
   });
 

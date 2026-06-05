@@ -48,6 +48,15 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
 
+  -- Singleton key/value table for user preferences. One row per key.
+  -- Today it only holds whatsapp_forwarding_enabled; new prefs slot in
+  -- without a schema migration.
+  CREATE TABLE IF NOT EXISTS user_prefs (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS idx_ports_detected ON detected_ports(detected_at DESC);
   CREATE INDEX IF NOT EXISTS idx_tabs_opened ON opened_tabs(opened_at DESC);
   CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(last_active DESC);

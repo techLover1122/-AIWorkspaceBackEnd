@@ -27,6 +27,8 @@
 import { info, warn } from "./logger.js";
 import { autoAllowPending, denyPending, isPending } from "../handlers/permission.js";
 import type { PermissionRequestPayload } from "../handlers/permission.js";
+import { isUserPresent, onPresenceChange } from "./presenceTracker.js";
+import { getWhatsAppForwardingEnabled } from "./userPrefs.js";
 
 const SIDECAR_URL = process.env.WHATSAPP_SIDECAR_URL ?? "http://127.0.0.1:8091";
 const AUTH_TOKEN = process.env.WHATSAPP_AUTH_TOKEN ?? "";
@@ -93,6 +95,200 @@ export function rememberSession(snapshot: LastSession): void {
 export function getLastSession(): LastSession {
   return { ...lastSession };
 }
+
+/* ──────────────────────────────────────────────────────────────────
+   Notification gating (the three-trigger rule)
+
+   A WhatsApp notify fires when at least ONE of these is true:
+     1. User opted in (per-workspace SQLite flag — survives reconnect,
+        lost on EC2 rebuild from snapshot).
+     2. User is absent — the workspace tab is closed, so no live SSE
+        stream is open (see presenceTracker).
+     3. The user-attention event has been pending for 5 minutes with no
+        resolution (deferred-notify scheduler below).
+
+   When none of these are true the notify is SUPPRESSED — case 3
+   schedules a 5-min delayed fire; cases 1 and 2 fire immediately.
+
+   Eligibility also requires:
+     - WhatsApp configured (WHATSAPP_AUTH_TOKEN set, isWhatsAppConfigured)
+     - WhatsApp paired (sidecar /status reports paired: true)
+   When either is false, "never" — silently drop.
+
+   New event types added later MUST go through shouldNotifyWhatsApp or
+   they'll bypass the gate.
+   ────────────────────────────────────────────────────────────────── */
+
+const FIVE_MIN_MS = 5 * 60 * 1000;
+const LINK_CACHE_TTL_MS = 30_000;
+
+let linkCache: { paired: boolean; checkedAt: number } | null = null;
+let linkInflight: Promise<boolean> | null = null;
+
+/** Cached "is WhatsApp paired" check. Hits the sidecar at most once per
+ *  30s in the steady state. Safe to call from hot paths. */
+export async function isWhatsAppLinked(): Promise<boolean> {
+  if (!isWhatsAppConfigured()) return false;
+  const now = Date.now();
+  if (linkCache && now - linkCache.checkedAt < LINK_CACHE_TTL_MS) {
+    return linkCache.paired;
+  }
+  if (linkInflight) return linkInflight;
+  linkInflight = (async () => {
+    try {
+      const res = await sidecarFetch("/status");
+      if (!res.ok) {
+        warn("isWhatsAppLinked: sidecar /status non-ok", { status: res.status });
+        linkCache = { paired: false, checkedAt: Date.now() };
+        return false;
+      }
+      const body = (await res.json()) as { paired?: boolean };
+      const paired = body.paired === true;
+      linkCache = { paired, checkedAt: Date.now() };
+      return paired;
+    } catch (err) {
+      warn("isWhatsAppLinked: sidecar /status threw", {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      linkCache = { paired: false, checkedAt: Date.now() };
+      return false;
+    } finally {
+      linkInflight = null;
+    }
+  })();
+  return linkInflight;
+}
+
+/** Invalidate the cache — call from the toggle endpoint or after
+ *  pair/unlink so the next gating decision uses fresh state. */
+export function invalidateWhatsAppLinkCache(): void {
+  linkCache = null;
+}
+
+export type NotifyDecision = "now" | "defer-5min" | "never";
+
+/** Decide whether (and when) to fire a WhatsApp notify for an
+ *  attention-event. Synchronous on the cached side; the link check is
+ *  async because we don't want stale state to silently disable the
+ *  integration. */
+export async function shouldNotifyWhatsApp(): Promise<NotifyDecision> {
+  if (!isWhatsAppConfigured()) return "never";
+  if (!(await isWhatsAppLinked())) return "never";
+  if (getWhatsAppForwardingEnabled()) return "now"; // case 1: opt-in
+  if (!isUserPresent()) return "now";              // case 2: absent
+  return "defer-5min";                              // case 3: idle timer
+}
+
+/* ──────────────────────────────────────────────────────────────────
+   Deferred-notify scheduler
+
+   For case 3 ("user idle 5 min on a pending prompt") we schedule the
+   notify and arm two cancellation paths:
+     - the prompt resolved (user answered in-app) → cancel
+     - the user became absent → fire immediately and cancel the timer
+       (case 2 short-circuits case 3)
+
+   Keyed by (taskId, key) so callers can cancel a specific pending
+   notify without affecting unrelated ones. `key` is the event type
+   plus any disambiguator (permissionId, toolUseId, etc.).
+   ────────────────────────────────────────────────────────────────── */
+
+type DeferredNotify = {
+  taskId: string;
+  key: string;
+  sessionId: string | null;
+  timer: ReturnType<typeof setTimeout>;
+  fire: () => Promise<void>;
+};
+
+const deferredNotifies = new Map<string, DeferredNotify>();
+
+function deferredId(taskId: string, key: string): string {
+  return `${taskId}:${key}`;
+}
+
+export interface DeferredNotifyOptions {
+  /** Tag with a sessionId so cancelDeferredNotifyForSession can sweep
+   *  all entries for that session — used by the task-completion case
+   *  where a new turn on the same session means "user is back, drop
+   *  the pending phone ping". */
+  sessionId?: string | null;
+  delayMs?: number;
+}
+
+export function scheduleDeferredNotify(
+  taskId: string,
+  key: string,
+  fire: () => Promise<void>,
+  opts: DeferredNotifyOptions = {}
+): void {
+  cancelDeferredNotify(taskId, key);
+  const id = deferredId(taskId, key);
+  const delay = opts.delayMs ?? FIVE_MIN_MS;
+  const timer = setTimeout(() => {
+    deferredNotifies.delete(id);
+    void fire().catch((err) => {
+      warn("deferred notify fire threw", {
+        taskId,
+        key,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }, delay);
+  deferredNotifies.set(id, {
+    taskId,
+    key,
+    sessionId: opts.sessionId ?? null,
+    timer,
+    fire,
+  });
+}
+
+export function cancelDeferredNotify(taskId: string, key: string): void {
+  const id = deferredId(taskId, key);
+  const entry = deferredNotifies.get(id);
+  if (!entry) return;
+  clearTimeout(entry.timer);
+  deferredNotifies.delete(id);
+}
+
+/** Cancel every deferred notify tagged with the given sessionId.
+ *  Called when a new chat turn lands for that session — "user replied,
+ *  no need to ping phone". */
+export function cancelDeferredNotifyForSession(sessionId: string): void {
+  let cleared = 0;
+  for (const [id, entry] of deferredNotifies) {
+    if (entry.sessionId !== sessionId) continue;
+    clearTimeout(entry.timer);
+    deferredNotifies.delete(id);
+    cleared++;
+  }
+  if (cleared > 0) {
+    info("cancelDeferredNotifyForSession cleared entries", { sessionId, cleared });
+  }
+}
+
+// When the user closes the workspace tab while one or more deferred
+// notifies are armed, fire them all immediately — case 2 supersedes
+// case 3's "wait 5 min". One-time wire-up at module load.
+onPresenceChange("absent", () => {
+  if (deferredNotifies.size === 0) return;
+  info("presence absent — firing all deferred WhatsApp notifies", {
+    count: deferredNotifies.size,
+  });
+  const drained = Array.from(deferredNotifies.values());
+  deferredNotifies.clear();
+  for (const entry of drained) {
+    clearTimeout(entry.timer);
+    void entry.fire().catch((err) => {
+      warn("absent-drain notify fire threw", {
+        taskId: entry.taskId,
+        key: entry.key,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+});
 
 /* ──────────────────────────────────────────────────────────────────
    Sidecar HTTP client

@@ -29,6 +29,11 @@ import {
   notifyPermission,
   notifyAskUserQuestion,
   rememberSession,
+  shouldNotifyWhatsApp,
+  scheduleDeferredNotify,
+  cancelDeferredNotify,
+  cancelDeferredNotifyForSession,
+  isWhatsAppLinked,
 } from "../utils/whatsappBridge.js";
 
 /**
@@ -1359,6 +1364,15 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     abortController,
   } = args;
 
+  // A new turn on an existing session means the user is engaged again —
+  // cancel any pending "task complete, ping phone in 5 min" notify
+  // tagged with this session. (Permission / AskUserQuestion deferreds
+  // are taskId-scoped and clean themselves up when the underlying
+  // prompt resolves.)
+  if (sessionId) {
+    cancelDeferredNotifyForSession(sessionId);
+  }
+
   const openPermissions = new Set<string>();
 
   // ── Intent Guard Agent ────────────────────────────────────────────────────
@@ -1463,10 +1477,21 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       suggestionCount: options.suggestions?.length ?? 0,
     });
     pushEvent(taskId, { type: "permission_request", data: payload });
-    // Mirror the permission to WhatsApp so the user can decide from
-    // their phone. Fire-and-forget; failures are logged inside the
-    // bridge and never block the SDK call.
-    void notifyPermission(taskId, payload);
+    // Route the permission to WhatsApp per the three-trigger gate
+    // (opt-in / absent / 5-min idle). Fire-and-forget; failures are
+    // logged inside the bridge and never block the SDK call.
+    const permKey = `perm:${id}`;
+    const firePermNotify = () => notifyPermission(taskId, payload);
+    void (async () => {
+      const decision = await shouldNotifyWhatsApp();
+      if (decision === "now") void firePermNotify();
+      else if (decision === "defer-5min") {
+        scheduleDeferredNotify(taskId, permKey, async () => {
+          if (!openPermissions.has(id)) return; // resolved before timer fired
+          await firePermNotify();
+        });
+      }
+    })();
 
     // ───── Timeout strategy: high-impact vs routine ─────
     //
@@ -1475,12 +1500,17 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     // purpose of the guard. The task stays paused indefinitely; only the
     // user's Allow/Deny click (or an explicit Stop) can unblock it.
     //
-    // Routine SDK-gated tools: keep the original 5-min auto-allow so long
-    // unattended runs (e.g. E2E test suites) don't stall on every file read.
+    // Routine SDK-gated tools: keep the 5-min auto-allow IFF WhatsApp is
+    // NOT linked. When linked, the gate above has already routed the
+    // prompt to the phone — auto-allowing would race the user's phone
+    // reply. The task waits indefinitely for either an in-app decision
+    // or a WhatsApp reply (handleIncomingMessage resolves the same
+    // pending Promise).
     const isHighImpact = toolAssessment.impactCategory !== "routine";
+    const whatsappLinked = await isWhatsAppLinked();
 
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-    if (!isHighImpact) {
+    if (!isHighImpact && !whatsappLinked) {
       timeoutHandle = setTimeout(() => {
         if (!openPermissions.has(id)) return;
         info("canUseTool auto-allow (5-min timeout):", {
@@ -1497,12 +1527,18 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
           data: { id, decision: "auto-allow", reason: "user-absent-timeout" },
         });
       }, PERMISSION_WAIT_MS);
-    } else {
+    } else if (isHighImpact) {
       info("canUseTool waiting indefinitely (high-impact tool):", {
         taskId,
         id,
         toolName,
         impactCategory: toolAssessment.impactCategory,
+      });
+    } else {
+      info("canUseTool waiting indefinitely (WhatsApp linked — phone takes over):", {
+        taskId,
+        id,
+        toolName,
       });
     }
 
@@ -1511,6 +1547,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
         openPermissions.delete(id);
       }
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      cancelDeferredNotify(taskId, permKey);
     };
     options.signal.addEventListener("abort", onAbort, { once: true });
     try {
@@ -1519,6 +1556,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       return result;
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      cancelDeferredNotify(taskId, permKey);
       options.signal.removeEventListener("abort", onAbort);
     }
   };
@@ -1752,19 +1790,31 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
                 headers: qs.map((q) => q.header),
                 note: "Frontend modal will intercept; this SDK call will auto-error and be suppressed.",
               });
-              // Also mirror the question to WhatsApp so the user can
-              // answer from their phone. The reply lands in the bridge's
+              // Route the question to WhatsApp per the three-trigger
+              // gate. The user's reply lands in the bridge's
               // handleIncomingMessage path, which submits the answer
               // back to /api/chat as a follow-up turn on the same
               // session.
-              void notifyAskUserQuestion({
-                taskId,
-                toolUseId: String(block.id ?? ""),
-                questions: qs,
-                sessionId: detectedSessionId,
-                workingDirectory: safeCwd ?? null,
-                permissionMode: permissionMode ?? null,
-              });
+              const askToolUseId = String(block.id ?? "");
+              const askKey = `ask:${askToolUseId}`;
+              const fireAskNotify = () =>
+                notifyAskUserQuestion({
+                  taskId,
+                  toolUseId: askToolUseId,
+                  questions: qs,
+                  sessionId: detectedSessionId,
+                  workingDirectory: safeCwd ?? null,
+                  permissionMode: permissionMode ?? null,
+                });
+              void (async () => {
+                const decision = await shouldNotifyWhatsApp();
+                if (decision === "now") void fireAskNotify();
+                else if (decision === "defer-5min") {
+                  scheduleDeferredNotify(taskId, askKey, fireAskNotify, {
+                    sessionId: detectedSessionId,
+                  });
+                }
+              })();
             }
           } else if (t === "tool_result") {
             const isErr = (block.is_error as boolean) ?? false;
@@ -1826,11 +1876,21 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
     pushEvent(taskId, { type: "done" });
     setTaskStatus(taskId, "done");
-    // Ping the user on WhatsApp with the agent's final text — the
-    // "your prompt is finished" notification. Fire-and-forget; if the
-    // sidecar isn't reachable or WhatsApp isn't paired the bridge logs
-    // and moves on.
-    void notifyTaskDone(taskId, finalAssistantText);
+    // Ping the user on WhatsApp with the agent's final text. Subject
+    // to the three-trigger gate (opt-in / absent / 5-min idle). The
+    // 5-min deferred case is tagged with sessionId so a new chat turn
+    // on the same session cancels the pending phone ping.
+    const doneKey = "complete";
+    const fireDoneNotify = () => notifyTaskDone(taskId, finalAssistantText);
+    void (async () => {
+      const decision = await shouldNotifyWhatsApp();
+      if (decision === "now") void fireDoneNotify();
+      else if (decision === "defer-5min") {
+        scheduleDeferredNotify(taskId, doneKey, fireDoneNotify, {
+          sessionId: detectedSessionId,
+        });
+      }
+    })();
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
       pushEvent(taskId, { type: "aborted" });

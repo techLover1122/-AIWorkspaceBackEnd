@@ -57,6 +57,8 @@ import {
   handleWhatsAppSetRecipient,
   handleWhatsAppUnlink,
   handleWhatsAppIncoming,
+  handleWhatsAppGetForwarding,
+  handleWhatsAppSetForwarding,
 } from "./handlers/whatsapp.js";
 import type { AppConfig } from "./types.js";
 
@@ -160,6 +162,8 @@ export function createApp(config: AppConfig) {
   app.post("/api/whatsapp/recipient", handleWhatsAppSetRecipient);
   app.post("/api/whatsapp/unlink", handleWhatsAppUnlink);
   app.post("/api/whatsapp/incoming", handleWhatsAppIncoming);
+  app.get("/api/whatsapp/forwarding", handleWhatsAppGetForwarding);
+  app.post("/api/whatsapp/forwarding", handleWhatsAppSetForwarding);
 
   app.get("/api/health", (c: Context) => c.json({ status: "ok", debug: config.debug }));
 
