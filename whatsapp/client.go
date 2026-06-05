@@ -37,12 +37,12 @@ type waClient struct {
 func newClient(ctx context.Context, dbPath, backendURL, authToken string) (*waClient, error) {
 	dbLog := waLog.Stdout("Database", "WARN", true)
 	dsn := "file:" + dbPath + "?_foreign_keys=on&_journal_mode=WAL"
-	container, err := sqlstore.New("sqlite3", dsn, dbLog)
+	container, err := sqlstore.New(ctx, "sqlite3", dsn, dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("open device store: %w", err)
 	}
 
-	device, err := container.GetFirstDevice()
+	device, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get first device: %w", err)
 	}
@@ -256,7 +256,7 @@ func (w *waClient) Unlink() error {
 	if !w.IsRegistered() {
 		return nil
 	}
-	if err := w.client.Logout(); err != nil {
+	if err := w.client.Logout(w.ctx); err != nil {
 		// Even if logout fails (network), nuke the local store so we
 		// don't stay stuck "paired but unusable" on the next boot.
 		w.client.Disconnect()
@@ -287,10 +287,6 @@ func (w *waClient) handleEvent(evt interface{}) {
 }
 
 func (w *waClient) handleMessage(m *events.Message) {
-	if m.Info.IsEphemeral {
-		// Skip view-once / disappearing messages; not the surface we want.
-		return
-	}
 	// Only accept messages from the paired user. IsFromMe covers
 	// messages the user sends from their own phone / Web — the natural
 	// "Message Yourself" surface. Treating only those as agent input
