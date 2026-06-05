@@ -61,6 +61,49 @@ const MCP_TOOL_NAMES = [
   "mcp__aiide__create_pack",
 ];
 
+// Phase 4 — Playwright MCP wired through to the desktop app.
+//
+// When PLAYWRIGHT_MCP_URL is set (typically pointing at a reverse-SSH-
+// tunneled `http://127.0.0.1:9090/` on this EC2, with the desktop
+// providing the upstream end), every Playwright MCP tool exposed by
+// @playwright/mcp becomes callable from the chat panel. Currently 43
+// tools — listing them all so the SDK's allow-list whitelist matches
+// each one explicitly.
+const PLAYWRIGHT_MCP_URL = process.env.PLAYWRIGHT_MCP_URL ?? null;
+const PLAYWRIGHT_TOOL_NAMES = PLAYWRIGHT_MCP_URL ? [
+  // core — page interaction primitives
+  "mcp__playwright__browser_snapshot",
+  "mcp__playwright__browser_click",
+  "mcp__playwright__browser_drag",
+  "mcp__playwright__browser_hover",
+  "mcp__playwright__browser_select_option",
+  "mcp__playwright__browser_type",
+  "mcp__playwright__browser_press_key",
+  "mcp__playwright__browser_handle_dialog",
+  "mcp__playwright__browser_take_screenshot",
+  "mcp__playwright__browser_file_upload",
+  "mcp__playwright__browser_close",
+  "mcp__playwright__browser_resize",
+  "mcp__playwright__browser_wait_for",
+  "mcp__playwright__browser_evaluate",
+  "mcp__playwright__browser_navigate",
+  "mcp__playwright__browser_navigate_back",
+  "mcp__playwright__browser_console_messages",
+  "mcp__playwright__browser_network_requests",
+  // core-tabs
+  "mcp__playwright__browser_tabs",
+  // vision — coordinate-based interactions
+  "mcp__playwright__browser_mouse_click_xy",
+  "mcp__playwright__browser_mouse_drag_xy",
+  "mcp__playwright__browser_mouse_move_xy",
+  // pdf
+  "mcp__playwright__browser_pdf_save",
+  // network
+  "mcp__playwright__browser_network_capture",
+  // devtools
+  "mcp__playwright__browser_devtools_console",
+] : [];
+
 /**
  * Workspace-environment context appended to every chat request's system
  * prompt. Without this the model treats the box as a normal Linux VM and
@@ -69,6 +112,96 @@ const MCP_TOOL_NAMES = [
  *
  * Filled at request time from env so it reflects this specific workspace.
  */
+/**
+ * The chat panel's most-load-bearing Phase 6 context.
+ *
+ * The `mcp__playwright__*` tools (browser_tabs / browser_snapshot /
+ * browser_click / etc.) connect via a reverse SSH tunnel to a Playwright
+ * MCP server running inside the user's desktop app. That MCP server
+ * drives the user's actual WebContentsView tabs over CDP — the same tabs
+ * the user sees in their workspace right now. NOT a sandboxed Chromium,
+ * NOT a Docker container.
+ *
+ * The other Playwright context (buildPlaywrightContext) talks about the
+ * Docker container with playwright-test for writing/running spec files.
+ * Two completely different surfaces; the model has historically conflated
+ * them because the tools all start with `browser_`. This context is the
+ * disambiguation.
+ *
+ * Only inserted when PLAYWRIGHT_MCP_URL is set (the tunnel is live).
+ */
+function buildDesktopBrowserContext(): string {
+  return [
+    "# Desktop browser control — mcp__playwright__ tools drive REAL user tabs",
+    "",
+    "## CRITICAL: which Playwright is this?",
+    "",
+    "When `mcp__playwright__browser_*` tools are available (they are right",
+    "now — that's why this section is in your context), they are connected",
+    "to the **user's actual desktop app**, NOT a sandbox.",
+    "",
+    "Concretely: there is an Electron app on the user's machine right now",
+    "called \"AI IDE Studio\" running this same workspace. Every tab the user",
+    "has open in their workspace is a real Chromium top-level page target,",
+    "addressable via the Playwright MCP server. When you call:",
+    "",
+    "- `browser_tabs list` → you get the user's real tab list (their VS Code,",
+    "  Odoo, gym site, code-server, etc.) — same one they see in the strip.",
+    "- `browser_tabs select index=N` → you switch Playwright's \"current",
+    "  page\" to the user's Nth tab.",
+    "- `browser_snapshot` → ARIA snapshot of THAT user's tab at this moment.",
+    "- `browser_click` / `browser_type` / `browser_navigate` → real",
+    "  interactions on the user's tab. The user SEES this happen.",
+    "- `browser_take_screenshot` → PNG of the user's tab content.",
+    "",
+    "## ❌ DO NOT say things like:",
+    "",
+    "- \"I can't access your real browser, Playwright runs in a sandbox.\"",
+    "- \"I'd have to open a new tab in a Docker container.\"",
+    "- \"I can only screenshot a sandboxed Chromium, not your real session.\"",
+    "",
+    "These are FALSE. When you say them, the user thinks the integration is",
+    "broken. It's not — these tools drive their actual session. Past chat",
+    "turns have correctly used these tools to fill forms and click buttons",
+    "in the user's real workspace; the tool surface has not changed.",
+    "",
+    "## ✅ What to do instead",
+    "",
+    "When the user says \"do X on the Y tab\" (e.g. \"complete the trainee",
+    "registration on the gym site\"):",
+    "",
+    "1. `browser_tabs list` — confirm the tab is there. If not, open it via",
+    "   `mcp__aiide__open_tab` (which adds it to the user's real workspace).",
+    "2. `browser_tabs select index=<that-tab>` — make it Playwright's current.",
+    "3. `browser_snapshot` — read the page's ARIA tree. Identify the form",
+    "   fields by their `[ref=eXX]` references.",
+    "4. `browser_type` / `browser_select_option` / `browser_click` against",
+    "   those refs to fill and submit the form.",
+    "5. `browser_snapshot` again or `browser_take_screenshot` to verify the",
+    "   result.",
+    "",
+    "If a form needs real personal data (name, email, phone) and the user",
+    "didn't supply it, ask them — but ask with the expectation that you",
+    "WILL fill the form once they answer, not with an apology that you",
+    "can't.",
+    "",
+    "## Relationship to the other Playwright section below",
+    "",
+    "The next section (E2E testing with `ai-ide-playwright`) is about",
+    "writing `.spec.ts` files and running them in a Docker container with",
+    "headless Chromium — for verifying YOUR code changes via automated",
+    "tests. That container has nothing to do with the user's browser tabs.",
+    "",
+    "Rule of thumb:",
+    "- User says \"act on my tab\" / \"go to X\" / \"click Y\" / \"fill the form on Z\"",
+    "  → `mcp__playwright__browser_*` (this section).",
+    "- User says \"write me an E2E test\" / \"verify my login feature works\"",
+    "  → `docker exec ai-ide-playwright npx playwright test` (next section).",
+    "",
+    "Both can coexist. Don't conflate them.",
+  ].join("\n");
+}
+
 function buildProxyContext(): string | null {
   const userId = process.env.USER_ID;
   const domain = process.env.PLATFORM_DOMAIN;
@@ -1348,6 +1481,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     const claudePath = process.env.CLAUDE_PATH;
     const mergedAllowedTools = [
       ...MCP_TOOL_NAMES,
+      ...PLAYWRIGHT_TOOL_NAMES,
       ...(allowedTools ?? []),
     ];
     info("Invoking SDK query:", {
@@ -1392,6 +1526,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     const proxyContext = buildProxyContext();
     const completionContext = buildCompletionVerificationContext();
     const playwrightContext = buildPlaywrightContext();
+    const desktopBrowserContext = PLAYWRIGHT_MCP_URL ? buildDesktopBrowserContext() : null;
     const hyperframesContext = buildHyperframesContext();
     const persistenceContext = buildPersistenceContext();
     const codeOrgContext = buildCodeOrganizationContext();
@@ -1405,6 +1540,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     // enforcement hook.
     const appendedSystem = [
       proxyContext,
+      desktopBrowserContext,
       playwrightContext,
       completionContext,
       hyperframesContext,
@@ -1456,7 +1592,16 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
         ...(safeCwd ? { cwd: safeCwd } : {}),
         allowedTools: mergedAllowedTools,
         disallowedTools: DISALLOWED_TOOLS,
-        mcpServers: { aiide: createAiideMcpServer({ workspaceDir: safeCwd }) },
+        mcpServers: {
+          aiide: createAiideMcpServer({ workspaceDir: safeCwd }),
+          // Phase 4 — Playwright MCP via the reverse SSH tunnel to the
+          // user's desktop app. `alwaysLoad` forces the tools into the
+          // turn-1 prompt instead of being deferred behind tool search,
+          // so the model sees them immediately without an extra step.
+          ...(PLAYWRIGHT_MCP_URL
+            ? { playwright: { type: "http" as const, url: PLAYWRIGHT_MCP_URL, alwaysLoad: true } }
+            : {}),
+        },
         // canUseTool is still passed for completeness — it'll just never
         // be invoked under bypassPermissions, but keeping it wired means
         // FORCE_BYPASS_PERMISSIONS = false re-enables the gate flow
