@@ -69,13 +69,20 @@ const MCP_TOOL_NAMES = [
 
 // Phase 4 — Playwright MCP wired through to the desktop app.
 //
-// When PLAYWRIGHT_MCP_URL is set (typically pointing at a reverse-SSH-
-// tunneled `http://127.0.0.1:9090/` on this EC2, with the desktop
-// providing the upstream end), every Playwright MCP tool exposed by
-// @playwright/mcp becomes callable from the chat panel. Currently 43
-// tools — listing them all so the SDK's allow-list whitelist matches
-// each one explicitly.
-const PLAYWRIGHT_MCP_URL = process.env.PLAYWRIGHT_MCP_URL ?? null;
+// Points at the reverse-SSH-tunneled `http://127.0.0.1:9090/` on this
+// EC2 (the desktop's Electron app provides the upstream end and auto-
+// manages the tunnel). The default is the tunnel address — set
+// PLAYWRIGHT_MCP_URL to an explicit value to override, or to "" / "off"
+// to disable the integration entirely. The SDK tolerates an unreachable
+// MCP URL at session start, so a dead tunnel doesn't block chat —
+// playwright tool calls just fail until the tunnel is back.
+const _rawMcpUrl = process.env.PLAYWRIGHT_MCP_URL;
+const PLAYWRIGHT_MCP_URL =
+  _rawMcpUrl === undefined
+    ? "http://127.0.0.1:9090/"
+    : _rawMcpUrl === "" || _rawMcpUrl.toLowerCase() === "off"
+      ? null
+      : _rawMcpUrl;
 const PLAYWRIGHT_TOOL_NAMES = PLAYWRIGHT_MCP_URL ? [
   // core — page interaction primitives
   "mcp__playwright__browser_snapshot",

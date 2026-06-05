@@ -54,6 +54,7 @@ import {
   handleWhatsAppStatus,
   handleWhatsAppQr,
   handleWhatsAppPairPhone,
+  handleWhatsAppSetRecipient,
   handleWhatsAppUnlink,
   handleWhatsAppIncoming,
 } from "./handlers/whatsapp.js";
@@ -156,6 +157,7 @@ export function createApp(config: AppConfig) {
   app.get("/api/whatsapp/status", handleWhatsAppStatus);
   app.get("/api/whatsapp/qr", handleWhatsAppQr);
   app.post("/api/whatsapp/pair-phone", handleWhatsAppPairPhone);
+  app.post("/api/whatsapp/recipient", handleWhatsAppSetRecipient);
   app.post("/api/whatsapp/unlink", handleWhatsAppUnlink);
   app.post("/api/whatsapp/incoming", handleWhatsAppIncoming);
 

@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,16 +25,19 @@ import (
 // QR holder for the polling endpoint, a webhook poster for incoming
 // messages, and a thin Send/Connect/Logout surface for the HTTP layer.
 type waClient struct {
-	ctx        context.Context
-	container  *sqlstore.Container
-	client     *whatsmeow.Client
-	webhook    *webhookPoster
+	ctx       context.Context
+	container *sqlstore.Container
+	client    *whatsmeow.Client
+	webhook   *webhookPoster
+	targetFile string // path to target.json — persists the recipient phone
 
 	mu          sync.RWMutex
-	currentQR   string // most recent QR code text from the pairing channel (empty after success)
-	qrActive    bool   // pairing flow is currently consuming the channel
-	pairingCode string // most recent phone-pairing code (empty after success)
-	lastPairErr string // last error from the pairing flow (surface to UI)
+	currentQR   string    // most recent QR code text from the pairing channel (empty after success)
+	qrActive    bool      // pairing flow is currently consuming the channel
+	pairingCode string    // most recent phone-pairing code (empty after success)
+	lastPairErr string    // last error from the pairing flow (surface to UI)
+	target      *types.JID // recipient JID — nil means "self chat" (Message Yourself)
+	targetPhone string    // phone form for display (E.164 with leading +)
 }
 
 func newClient(ctx context.Context, dbPath, backendURL, authToken string) (*waClient, error) {
@@ -51,13 +57,50 @@ func newClient(ctx context.Context, dbPath, backendURL, authToken string) (*waCl
 	cli := whatsmeow.NewClient(device, clientLog)
 
 	wa := &waClient{
-		ctx:       ctx,
-		container: container,
-		client:    cli,
-		webhook:   newWebhookPoster(backendURL, authToken),
+		ctx:        ctx,
+		container:  container,
+		client:     cli,
+		webhook:    newWebhookPoster(backendURL, authToken),
+		targetFile: filepath.Join(filepath.Dir(dbPath), "target.json"),
 	}
+	wa.loadTargetFromDisk()
 	cli.AddEventHandler(wa.handleEvent)
 	return wa, nil
+}
+
+// loadTargetFromDisk repopulates the in-memory target from
+// targetFile if it exists. Called once at startup so a configured
+// recipient survives sidecar restarts.
+func (w *waClient) loadTargetFromDisk() {
+	data, err := os.ReadFile(w.targetFile)
+	if err != nil {
+		return // no target configured yet
+	}
+	var stored struct {
+		Phone string `json:"phone"`
+	}
+	if json.Unmarshal(data, &stored) != nil || stored.Phone == "" {
+		return
+	}
+	jid := jidFromPhone(stored.Phone)
+	if jid == nil {
+		return
+	}
+	w.mu.Lock()
+	w.target = jid
+	w.targetPhone = "+" + jid.User
+	w.mu.Unlock()
+}
+
+// jidFromPhone parses a free-form phone string and returns the
+// corresponding 1:1 chat JID, or nil if the phone can't be normalized.
+func jidFromPhone(phone string) *types.JID {
+	clean := normalizePhone(phone)
+	if clean == "" {
+		return nil
+	}
+	jid := types.NewJID(clean, types.DefaultUserServer)
+	return &jid
 }
 
 func (w *waClient) Close() {
@@ -87,25 +130,28 @@ func (w *waClient) Connect() error {
 
 // Status snapshots what the HTTP /status endpoint needs.
 type Status struct {
-	Paired      bool   `json:"paired"`
-	Connected   bool   `json:"connected"`
-	JID         string `json:"jid,omitempty"`
-	Phone       string `json:"phone,omitempty"`
-	PairingCode string `json:"pairingCode,omitempty"`
-	LastError   string `json:"lastError,omitempty"`
+	Paired        bool   `json:"paired"`
+	Connected     bool   `json:"connected"`
+	JID           string `json:"jid,omitempty"`
+	Phone         string `json:"phone,omitempty"`
+	PairingCode   string `json:"pairingCode,omitempty"`
+	LastError     string `json:"lastError,omitempty"`
+	RecipientPhone string `json:"recipientPhone,omitempty"` // empty = self-chat fallback
 }
 
 func (w *waClient) Status() Status {
 	w.mu.RLock()
 	pairingCode := w.pairingCode
 	lastErr := w.lastPairErr
+	recipient := w.targetPhone
 	w.mu.RUnlock()
 
 	s := Status{
-		Paired:      w.IsRegistered(),
-		Connected:   w.client.IsConnected(),
-		PairingCode: pairingCode,
-		LastError:   lastErr,
+		Paired:         w.IsRegistered(),
+		Connected:      w.client.IsConnected(),
+		PairingCode:    pairingCode,
+		LastError:      lastErr,
+		RecipientPhone: recipient,
 	}
 	if w.IsRegistered() {
 		id := w.client.Store.ID
@@ -113,6 +159,53 @@ func (w *waClient) Status() Status {
 		s.Phone = "+" + id.User
 	}
 	return s
+}
+
+// SetRecipient configures the outbound JID. Empty phone clears the
+// override and falls back to the self-chat. Persists to targetFile so
+// a sidecar restart keeps the choice. Returns the cleaned E.164 phone
+// (with leading +) so the HTTP layer can echo it back.
+func (w *waClient) SetRecipient(phone string) (string, error) {
+	if strings.TrimSpace(phone) == "" {
+		// Clear → fall back to self.
+		w.mu.Lock()
+		w.target = nil
+		w.targetPhone = ""
+		w.mu.Unlock()
+		_ = os.Remove(w.targetFile)
+		return "", nil
+	}
+	jid := jidFromPhone(phone)
+	if jid == nil {
+		return "", errors.New("phone must be in E.164 format, e.g. +14155552671")
+	}
+	clean := "+" + jid.User
+	w.mu.Lock()
+	w.target = jid
+	w.targetPhone = clean
+	w.mu.Unlock()
+	// Persist — best-effort; if disk write fails we still keep the
+	// in-memory value working for this session.
+	data, _ := json.Marshal(map[string]string{"phone": clean})
+	_ = os.WriteFile(w.targetFile, data, 0o644)
+	return clean, nil
+}
+
+// Recipient returns the active outbound JID + display phone. Falls
+// back to the linked-account self-JID when no override is configured.
+func (w *waClient) recipient() (types.JID, bool) {
+	w.mu.RLock()
+	override := w.target
+	w.mu.RUnlock()
+	if override != nil {
+		return *override, true
+	}
+	if w.client.Store == nil || w.client.Store.ID == nil {
+		return types.JID{}, false
+	}
+	self := *w.client.Store.ID
+	self.Device = 0
+	return self, false
 }
 
 // CurrentQR returns the most recently emitted QR code from the pairing
@@ -228,8 +321,10 @@ func (w *waClient) BeginPhonePairing(phone string) (string, error) {
 	return code, nil
 }
 
-// SendText sends a text message to the paired user's own JID (i.e. the
-// "Message Yourself" chat). Used for outbound agent notifications.
+// SendText sends a text message to the configured recipient. When no
+// recipient is configured this falls back to the paired user's own JID
+// (the "Message Yourself" chat) so an unconfigured workspace still has
+// a sensible default.
 func (w *waClient) SendText(text string) error {
 	if !w.IsRegistered() {
 		return errors.New("not paired")
@@ -240,8 +335,10 @@ func (w *waClient) SendText(text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("text is empty")
 	}
-	target := *w.client.Store.ID
-	target.Device = 0 // address the user, not a specific device
+	target, _ := w.recipient()
+	if target.User == "" {
+		return errors.New("no recipient resolved (store empty?)")
+	}
 	msg := &waProto.Message{Conversation: proto.String(text)}
 	ctx, cancel := context.WithTimeout(w.ctx, 15*time.Second)
 	defer cancel()
@@ -265,7 +362,10 @@ func (w *waClient) Unlink() error {
 	w.currentQR = ""
 	w.pairingCode = ""
 	w.qrActive = false
+	w.target = nil
+	w.targetPhone = ""
 	w.mu.Unlock()
+	_ = os.Remove(w.targetFile)
 	return nil
 }
 
@@ -287,11 +387,27 @@ func (w *waClient) handleEvent(evt interface{}) {
 }
 
 func (w *waClient) handleMessage(m *events.Message) {
-	// Only accept messages from the paired user. IsFromMe covers
-	// messages the user sends from their own phone / Web — the natural
-	// "Message Yourself" surface. Treating only those as agent input
-	// prevents random WhatsApp contacts from driving the agent.
-	if !m.Info.IsFromMe {
+	// Inbound filter — depends on whether a custom recipient is set:
+	//   * Recipient configured → accept ONLY messages whose chat is
+	//     that recipient. Their replies are the agent's user input.
+	//   * No recipient → accept IsFromMe (messages typed in the
+	//     "Message Yourself" chat). The default self-chat flow.
+	// Either way, random unrelated contacts can never drive the agent.
+	w.mu.RLock()
+	override := w.target
+	w.mu.RUnlock()
+	if override != nil {
+		if m.Info.Chat.User != override.User {
+			return
+		}
+		// Skip the linked device's own echo of its outbound message
+		// (whatsmeow surfaces those too). Without this guard, the
+		// agent's WhatsApp post would loop right back as an "incoming"
+		// turn.
+		if m.Info.IsFromMe {
+			return
+		}
+	} else if !m.Info.IsFromMe {
 		return
 	}
 	text := extractText(m.Message)

@@ -27,6 +27,7 @@ import {
   isWhatsAppConfigured,
   sidecarPairPhone,
   sidecarQr,
+  sidecarSetRecipient,
   sidecarStatus,
   sidecarUnlink,
 } from "../utils/whatsappBridge.js";
@@ -95,6 +96,27 @@ export async function handleWhatsAppPairPhone(c: Context) {
     return c.json(data);
   } catch (err) {
     warn("WhatsApp pair-phone failed:", {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return c.json({ error: "Sidecar unreachable" }, 502);
+  }
+}
+
+export async function handleWhatsAppSetRecipient(c: Context) {
+  if (!isWhatsAppConfigured()) return notConfigured(c);
+  let body: { phone?: string };
+  try {
+    body = (await c.req.json()) as { phone?: string };
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  // Allow empty string to clear the override (fall back to self).
+  const phone = typeof body.phone === "string" ? body.phone : "";
+  try {
+    const data = await sidecarSetRecipient(phone);
+    return c.json(data);
+  } catch (err) {
+    warn("WhatsApp set-recipient failed:", {
       err: err instanceof Error ? err.message : String(err),
     });
     return c.json({ error: "Sidecar unreachable" }, 502);

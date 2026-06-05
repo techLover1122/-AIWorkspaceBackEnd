@@ -104,6 +104,28 @@ func newRouter(wa *waClient, authToken string) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}))
 
+	// Configure the outbound recipient. Empty phone clears it and the
+	// sidecar falls back to the linked account's self-chat.
+	mux.HandleFunc("/recipient", auth(authToken, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, http.StatusMethodNotAllowed, errors.New("POST required"))
+			return
+		}
+		var body struct {
+			Phone string `json:"phone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		clean, err := wa.SetRecipient(body.Phone)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"recipientPhone": clean})
+	}))
+
 	return mux
 }
 

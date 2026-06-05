@@ -141,6 +141,15 @@ export async function sidecarUnlink(): Promise<unknown> {
   return res.json();
 }
 
+/** Proxy POST /recipient — set or clear the outbound phone. */
+export async function sidecarSetRecipient(phone: string): Promise<unknown> {
+  const res = await sidecarFetch("/recipient", {
+    method: "POST",
+    body: JSON.stringify({ phone }),
+  });
+  return res.json();
+}
+
 /** Internal: POST /send. Swallows errors with a warn log so the chat
  *  task never crashes because WhatsApp is unhappy. */
 async function sidecarSend(text: string): Promise<boolean> {
