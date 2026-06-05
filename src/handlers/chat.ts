@@ -24,6 +24,12 @@ import {
 import { runIntentGuard, denyIntentGuard } from "../middleware/intentGuardAgent.js";
 import { assessTool, createSessionHistory, recordApproval } from "../middleware/toolGuardAgent.js";
 import { runAnomalyDetection, type ExecutedAction } from "../middleware/anomalyDetectionAgent.js";
+import {
+  notifyTaskDone,
+  notifyPermission,
+  notifyAskUserQuestion,
+  rememberSession,
+} from "../utils/whatsappBridge.js";
 
 /**
  * How long canUseTool waits on a user permission decision before
@@ -1450,6 +1456,10 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       suggestionCount: options.suggestions?.length ?? 0,
     });
     pushEvent(taskId, { type: "permission_request", data: payload });
+    // Mirror the permission to WhatsApp so the user can decide from
+    // their phone. Fire-and-forget; failures are logged inside the
+    // bridge and never block the SDK call.
+    void notifyPermission(taskId, payload);
 
     // ───── Timeout strategy: high-impact vs routine ─────
     //
@@ -1657,6 +1667,14 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       if (msg.session_id) {
         detectedSessionId = msg.session_id;
         setTaskSessionId(taskId, msg.session_id);
+        // Make the WhatsApp bridge aware of the active session so an
+        // incoming WhatsApp message can resume the same conversation
+        // instead of starting a fresh one.
+        rememberSession({
+          sessionId: msg.session_id,
+          workingDirectory: safeCwd ?? null,
+          permissionMode: permissionMode ?? null,
+        });
       }
       if (msg.type === "assistant" || msg.type === "user") messageCount++;
 
@@ -1712,14 +1730,33 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
             });
             if (block.name === "AskUserQuestion") {
               const qs =
-                (block.input as { questions?: Array<{ header?: string; question?: string }> })
-                  ?.questions ?? [];
+                (block.input as {
+                  questions?: Array<{
+                    header?: string;
+                    question?: string;
+                    multiSelect?: boolean;
+                    options?: Array<{ label?: string; description?: string }>;
+                  }>;
+                })?.questions ?? [];
               info("SDK AskUserQuestion detected:", {
                 taskId,
                 tool_use_id: block.id,
                 questionCount: qs.length,
                 headers: qs.map((q) => q.header),
                 note: "Frontend modal will intercept; this SDK call will auto-error and be suppressed.",
+              });
+              // Also mirror the question to WhatsApp so the user can
+              // answer from their phone. The reply lands in the bridge's
+              // handleIncomingMessage path, which submits the answer
+              // back to /api/chat as a follow-up turn on the same
+              // session.
+              void notifyAskUserQuestion({
+                taskId,
+                toolUseId: String(block.id ?? ""),
+                questions: qs,
+                sessionId: detectedSessionId,
+                workingDirectory: safeCwd ?? null,
+                permissionMode: permissionMode ?? null,
               });
             }
           } else if (t === "tool_result") {
@@ -1782,6 +1819,11 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
     pushEvent(taskId, { type: "done" });
     setTaskStatus(taskId, "done");
+    // Ping the user on WhatsApp with the agent's final text — the
+    // "your prompt is finished" notification. Fire-and-forget; if the
+    // sidecar isn't reachable or WhatsApp isn't paired the bridge logs
+    // and moves on.
+    void notifyTaskDone(taskId, finalAssistantText);
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
       pushEvent(taskId, { type: "aborted" });

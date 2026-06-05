@@ -50,6 +50,13 @@ import {
   handlePluginIndex,
   handlePluginJs,
 } from "./handlers/plugin.js";
+import {
+  handleWhatsAppStatus,
+  handleWhatsAppQr,
+  handleWhatsAppPairPhone,
+  handleWhatsAppUnlink,
+  handleWhatsAppIncoming,
+} from "./handlers/whatsapp.js";
 import type { AppConfig } from "./types.js";
 
 export function createApp(config: AppConfig) {
@@ -139,6 +146,18 @@ export function createApp(config: AppConfig) {
   // Intent Guard decision bridge — frontend posts the user's chosen
   // interpretation (narrow/broad) before the SDK query starts.
   app.post("/api/intent-guard/:id", handleIntentGuardDecision);
+
+  // WhatsApp integration — pairing/status proxied to the Go sidecar
+  // on 127.0.0.1:8091 (ai-ide-whatsapp.service), webhook receives
+  // incoming messages and routes them to permission decisions /
+  // AskUserQuestion answers / new chat turns. See handlers/whatsapp.ts
+  // and utils/whatsappBridge.ts. Configured via WHATSAPP_AUTH_TOKEN +
+  // WHATSAPP_SIDECAR_URL in /etc/workspace.env.
+  app.get("/api/whatsapp/status", handleWhatsAppStatus);
+  app.get("/api/whatsapp/qr", handleWhatsAppQr);
+  app.post("/api/whatsapp/pair-phone", handleWhatsAppPairPhone);
+  app.post("/api/whatsapp/unlink", handleWhatsAppUnlink);
+  app.post("/api/whatsapp/incoming", handleWhatsAppIncoming);
 
   app.get("/api/health", (c: Context) => c.json({ status: "ok", debug: config.debug }));
 

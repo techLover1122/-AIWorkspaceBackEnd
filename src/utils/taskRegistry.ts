@@ -46,8 +46,15 @@ const tasks = new Map<string, Task>();
 
 /** Idle TTL for completed/errored/aborted tasks. While a task is `running`
  *  it's never evicted regardless of how long it sits — the SDK call itself
- *  is the work that needs to complete. */
-const COMPLETED_TASK_TTL_MS = 30 * 60 * 1000; // 30 min
+ *  is the work that needs to complete.
+ *
+ *  Set generously (7 days) so users who close the tab during a run and
+ *  come back the next day can still reattach to the completed task and
+ *  resume from the buffered event stream rather than triggering the
+ *  frontend's onTaskGone path. Per-task buffer is already capped at
+ *  MAX_BYTES_PER_TASK below, so memory growth is bounded by task count,
+ *  not retention window. */
+const COMPLETED_TASK_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 /** Per-task buffer soft cap. When exceeded, we drop the oldest event from
  *  the buffer to make room — but we never drop `permission_request` events
  *  (those are referenced by an external pending Promise the user still

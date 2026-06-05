@@ -368,6 +368,102 @@ for svc in "code-server@${TARGET_USER}" ai-ide-backend ai-ide-frontend; do
 done
 
 # ────────────────────────────────────────────────────────────────────
+# Step 7b — WhatsApp sidecar (ai-ide-whatsapp.service)
+# ────────────────────────────────────────────────────────────────────
+#
+# Tiny Go service that owns the WhatsApp connection (whatsmeow) and
+# exposes a localhost-only HTTP API the Node backend proxies. Source
+# lives in the backend repo at backend/whatsapp/. Built here at first
+# boot and on subsequent re-runs (the build is cheap once Go is cached).
+#
+# Wiring:
+#   - WHATSAPP_AUTH_TOKEN  shared secret, generated once and stored in
+#                          /etc/workspace.env so backend + sidecar agree.
+#   - 127.0.0.1:8091       sidecar listen addr (not exposed via Traefik).
+#   - /var/lib/ai-ide/whatsapp/session.db   whatsmeow's pairing store.
+#
+# The integration is dormant until the user pairs via the chat-panel
+# "Link WhatsApp" button — the sidecar runs but doesn't connect to
+# WhatsApp servers until /qr or /pair-phone is hit.
+
+hdr "Step 7b — WhatsApp sidecar (Go)"
+
+WA_SRC="${PROJECT_DIR}/backend/whatsapp"
+WA_BIN="/usr/local/bin/ai-ide-whatsapp"
+WA_STATE_DIR="/var/lib/ai-ide/whatsapp"
+
+if [ ! -d "$WA_SRC" ]; then
+  log "WARN: $WA_SRC not found — skipping WhatsApp sidecar (older backend checkout?)"
+else
+  # 1. Ensure Go is installed (apt's `golang` is fine — we don't need
+  #    the very latest). Cached on subsequent re-runs.
+  if ! command -v go >/dev/null 2>&1; then
+    log "Installing Go toolchain"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends golang-go
+  fi
+
+  # 2. Build the sidecar binary as the workspace user (so the module
+  #    cache lives under ~/.cache/go-build, not root's). The output
+  #    binary itself is installed system-wide.
+  log "Building ai-ide-whatsapp sidecar"
+  as_user bash -lc "cd '$WA_SRC' && GOFLAGS=-mod=mod go build -o /tmp/ai-ide-whatsapp ."
+  install -m 755 /tmp/ai-ide-whatsapp "$WA_BIN"
+  rm -f /tmp/ai-ide-whatsapp
+
+  # 3. Generate the shared auth token once. Idempotent — if a token
+  #    already exists in /etc/workspace.env we keep it (otherwise an
+  #    existing paired session would be locked out after a re-run).
+  if ! grep -q '^WHATSAPP_AUTH_TOKEN=' /etc/workspace.env 2>/dev/null; then
+    token="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 40)"
+    {
+      echo ""
+      echo "# ai-ide-whatsapp shared bearer token"
+      echo "WHATSAPP_AUTH_TOKEN=${token}"
+      echo "WHATSAPP_SIDECAR_URL=http://127.0.0.1:8091"
+    } >> /etc/workspace.env
+    log "Wrote WHATSAPP_AUTH_TOKEN to /etc/workspace.env"
+  else
+    log "WHATSAPP_AUTH_TOKEN already present in /etc/workspace.env — leaving it"
+  fi
+
+  # 4. Session store dir owned by the workspace user so the sidecar can
+  #    write the sqlite db without sudo.
+  mkdir -p "$WA_STATE_DIR"
+  chown -R "$TARGET_USER:$TARGET_USER" "$WA_STATE_DIR"
+
+  # 5. systemd unit. Loads /etc/workspace.env so WHATSAPP_AUTH_TOKEN
+  #    propagates here. Bound to localhost only.
+  cat > /etc/systemd/system/ai-ide-whatsapp.service <<EOF
+[Unit]
+Description=AI-IDE WhatsApp sidecar (whatsmeow on 127.0.0.1:8091)
+After=network.target
+
+[Service]
+Type=simple
+User=${TARGET_USER}
+EnvironmentFile=/etc/workspace.env
+Environment=LISTEN_ADDR=127.0.0.1:8091
+Environment=SESSION_DIR=${WA_STATE_DIR}
+Environment=BACKEND_WEBHOOK_URL=http://127.0.0.1:${BACKEND_PORT}/api/whatsapp/incoming
+ExecStart=${WA_BIN}
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now ai-ide-whatsapp || log "WARN: failed to start ai-ide-whatsapp"
+  # Restart the backend so it picks up the new WHATSAPP_AUTH_TOKEN /
+  # WHATSAPP_SIDECAR_URL env vars from /etc/workspace.env.
+  systemctl restart ai-ide-backend || true
+  log "  ai-ide-whatsapp: $(systemctl is-active ai-ide-whatsapp || true)"
+fi
+
+# ────────────────────────────────────────────────────────────────────
 # Step 8 — Docs/Sheets bridge boot recipes
 # ────────────────────────────────────────────────────────────────────
 #
