@@ -147,8 +147,8 @@ export function analyzeAmbiguity(userMessage: string): AmbiguityAnalysis | null 
   const resetVerb = /\b(reset|clear)\b/i.test(userMessage);
   const actionWord = deleteVerb ? "delete" : resetVerb ? "reset" : "update";
 
-  const narrowLabel = `Sirf ek specific ${singular} (query / find)`;
-  const broadLabel = `Tamam ${noun} ${actionWord} karo`;
+  const narrowLabel = `Find a specific ${singular} (read-only, no changes)`;
+  const broadLabel = `${actionWord.charAt(0).toUpperCase() + actionWord.slice(1)} ALL ${noun} ⚠️`;
 
   return {
     isAmbiguous: true,
@@ -166,7 +166,7 @@ export function analyzeAmbiguity(userMessage: string): AmbiguityAnalysis | null 
       isLargeScale: true,
       estimatedScope: `all ${noun}`,
     },
-    question: `"${userMessage}" — aap ka kya matlab hai?`,
+    question: `You said: "${userMessage}" — what did you mean?`,
   };
 }
 
