@@ -1279,12 +1279,24 @@ export async function handleChatRequest(c: Context) {
     workingDirectory,
     permissionMode,
     attachments,
+    origin,
   } = body;
 
+  // For WhatsApp-originated turns with no caller-supplied cwd, default
+  // to the user's home directory rather than the backend's own source
+  // tree — that gives the agent a useful starting point for a friend's
+  // cold-start question. For UI turns we leave it untouched so the
+  // explicit workspace picker still wins.
+  const effectiveWorkingDirectory =
+    workingDirectory ?? (origin === "whatsapp" ? process.env.HOME ?? "/home/ubuntu" : undefined);
+
   // Only use cwd if it actually exists — a missing cwd causes ENOENT on spawn.
-  const safeCwd = workingDirectory && existsSync(workingDirectory) ? workingDirectory : undefined;
-  if (workingDirectory && !safeCwd) {
-    warn(`Working directory does not exist, ignoring: ${workingDirectory}`);
+  const safeCwd =
+    effectiveWorkingDirectory && existsSync(effectiveWorkingDirectory)
+      ? effectiveWorkingDirectory
+      : undefined;
+  if (effectiveWorkingDirectory && !safeCwd) {
+    warn(`Working directory does not exist, ignoring: ${effectiveWorkingDirectory}`);
   }
 
   const isContinue = typeof message === "string" && message.trim() === "continue";
@@ -1326,6 +1338,7 @@ export async function handleChatRequest(c: Context) {
     allowedTools,
     attachments,
     abortController,
+    origin,
   });
 
   return c.json({ taskId });
@@ -1340,6 +1353,7 @@ interface RunChatTaskArgs {
   allowedTools?: string[];
   attachments?: ChatRequest["attachments"];
   abortController: AbortController;
+  origin?: ChatRequest["origin"];
 }
 
 /**
@@ -1362,7 +1376,13 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     allowedTools,
     attachments,
     abortController,
+    origin,
   } = args;
+
+  // WhatsApp-originated turns bypass the three-trigger gate — replies
+  // and prompts for this turn always route straight back to WhatsApp.
+  // Whoever started the conversation owns answering it.
+  const isWhatsAppTurn = origin === "whatsapp";
 
   // A new turn on an existing session means the user is engaged again —
   // cancel any pending "task complete, ping phone in 5 min" notify
@@ -1477,21 +1497,26 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       suggestionCount: options.suggestions?.length ?? 0,
     });
     pushEvent(taskId, { type: "permission_request", data: payload });
-    // Route the permission to WhatsApp per the three-trigger gate
-    // (opt-in / absent / 5-min idle). Fire-and-forget; failures are
-    // logged inside the bridge and never block the SDK call.
+    // Route the permission to WhatsApp. For WhatsApp-originated turns
+    // the prompt always goes to the phone immediately — the friend who
+    // asked owns answering it. For UI-originated turns, the three-
+    // trigger gate (opt-in / absent / 5-min idle) decides.
     const permKey = `perm:${id}`;
     const firePermNotify = () => notifyPermission(taskId, payload);
-    void (async () => {
-      const decision = await shouldNotifyWhatsApp();
-      if (decision === "now") void firePermNotify();
-      else if (decision === "defer-5min") {
-        scheduleDeferredNotify(taskId, permKey, async () => {
-          if (!openPermissions.has(id)) return; // resolved before timer fired
-          await firePermNotify();
-        });
-      }
-    })();
+    if (isWhatsAppTurn) {
+      void firePermNotify();
+    } else {
+      void (async () => {
+        const decision = await shouldNotifyWhatsApp();
+        if (decision === "now") void firePermNotify();
+        else if (decision === "defer-5min") {
+          scheduleDeferredNotify(taskId, permKey, async () => {
+            if (!openPermissions.has(id)) return; // resolved before timer fired
+            await firePermNotify();
+          });
+        }
+      })();
+    }
 
     // ───── Timeout strategy: high-impact vs routine ─────
     //
@@ -1806,15 +1831,19 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
                   workingDirectory: safeCwd ?? null,
                   permissionMode: permissionMode ?? null,
                 });
-              void (async () => {
-                const decision = await shouldNotifyWhatsApp();
-                if (decision === "now") void fireAskNotify();
-                else if (decision === "defer-5min") {
-                  scheduleDeferredNotify(taskId, askKey, fireAskNotify, {
-                    sessionId: detectedSessionId,
-                  });
-                }
-              })();
+              if (isWhatsAppTurn) {
+                void fireAskNotify();
+              } else {
+                void (async () => {
+                  const decision = await shouldNotifyWhatsApp();
+                  if (decision === "now") void fireAskNotify();
+                  else if (decision === "defer-5min") {
+                    scheduleDeferredNotify(taskId, askKey, fireAskNotify, {
+                      sessionId: detectedSessionId,
+                    });
+                  }
+                })();
+              }
             }
           } else if (t === "tool_result") {
             const isErr = (block.is_error as boolean) ?? false;
@@ -1876,21 +1905,26 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
     pushEvent(taskId, { type: "done" });
     setTaskStatus(taskId, "done");
-    // Ping the user on WhatsApp with the agent's final text. Subject
-    // to the three-trigger gate (opt-in / absent / 5-min idle). The
-    // 5-min deferred case is tagged with sessionId so a new chat turn
+    // Ping the user on WhatsApp with the agent's final text. WhatsApp-
+    // originated turns fire the reply immediately (the friend who asked
+    // is waiting); UI turns go through the three-trigger gate, with
+    // the 5-min deferred case tagged with sessionId so a new chat turn
     // on the same session cancels the pending phone ping.
     const doneKey = "complete";
     const fireDoneNotify = () => notifyTaskDone(taskId, finalAssistantText);
-    void (async () => {
-      const decision = await shouldNotifyWhatsApp();
-      if (decision === "now") void fireDoneNotify();
-      else if (decision === "defer-5min") {
-        scheduleDeferredNotify(taskId, doneKey, fireDoneNotify, {
-          sessionId: detectedSessionId,
-        });
-      }
-    })();
+    if (isWhatsAppTurn) {
+      void fireDoneNotify();
+    } else {
+      void (async () => {
+        const decision = await shouldNotifyWhatsApp();
+        if (decision === "now") void fireDoneNotify();
+        else if (decision === "defer-5min") {
+          scheduleDeferredNotify(taskId, doneKey, fireDoneNotify, {
+            sessionId: detectedSessionId,
+          });
+        }
+      })();
+    }
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
       pushEvent(taskId, { type: "aborted" });

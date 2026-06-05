@@ -618,6 +618,11 @@ async function startChatTurn(args: {
   const body = {
     message: args.message,
     requestId,
+    // Tag the turn as WhatsApp-originated so the chat handler bypasses
+    // the presence/idle gate and routes replies + prompts straight back
+    // to the phone. Also lets the handler default the working directory
+    // to $HOME for cold-start friends with no prior session seed.
+    origin: "whatsapp" as const,
     ...(args.sessionId ? { sessionId: args.sessionId } : {}),
     ...(args.workingDirectory ? { workingDirectory: args.workingDirectory } : {}),
     ...(args.permissionMode ? { permissionMode: args.permissionMode } : {}),

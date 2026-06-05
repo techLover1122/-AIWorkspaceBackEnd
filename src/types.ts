@@ -50,6 +50,12 @@ export interface ChatRequest {
   /** Image attachments — sent to Claude as multimodal content blocks
    *  instead of file mentions. */
   attachments?: ChatAttachmentPayload[];
+  /** Where the turn was started. "whatsapp" means an inbound WhatsApp
+   *  message kicked off this chat — replies / permission prompts /
+   *  AskUserQuestion blocks for this turn route straight back to
+   *  WhatsApp, bypassing the presence + 5-min-idle gate. Default
+   *  (undefined) keeps the gated behavior. */
+  origin?: "whatsapp";
 }
 
 export interface ProjectInfo {
