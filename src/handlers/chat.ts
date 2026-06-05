@@ -11,6 +11,7 @@ import {
   setTaskSessionId,
   setTaskStatus,
   setTaskAbsentMode,
+  setTaskCapturedIntent,
   abortTask as abortTaskInRegistry,
   getTask,
 } from "../utils/taskRegistry.js";
@@ -20,6 +21,9 @@ import {
   autoAllowPending,
   type PermissionRequestPayload,
 } from "./permission.js";
+import { runIntentGuard, denyIntentGuard } from "../middleware/intentGuardAgent.js";
+import { assessTool, createSessionHistory, recordApproval } from "../middleware/toolGuardAgent.js";
+import { runAnomalyDetection, type ExecutedAction } from "../middleware/anomalyDetectionAgent.js";
 
 /**
  * How long canUseTool waits on a user permission decision before
@@ -1182,13 +1186,64 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
   const openPermissions = new Set<string>();
 
+  // ── Intent Guard Agent ────────────────────────────────────────────────────
+  // Runs before query(). If the message is ambiguous (e.g. "employees ki
+  // salary 50,000 karo" — query vs mass-update?), pauses and shows a
+  // two-option clarification modal. The chosen interpretation is prepended
+  // to the prompt so the main agent follows the correct scope.
+  let promptPrefix = "";
+  const capturedIntent = await runIntentGuard(
+    taskId,
+    message,
+    pushEvent,
+    abortController.signal
+  );
+  if (capturedIntent) {
+    promptPrefix = capturedIntent.promptPrefix + "\n\n";
+    setTaskCapturedIntent(taskId, capturedIntent);
+  }
+
+  // ── Tool Guard Agent — session history ───────────────────────────────────
+  // Tracks high-impact tool approvals within this task so we can detect
+  // dramatic scope escalation (e.g. approved 8 rows before, now 400).
+  const toolGuardHistory = createSessionHistory();
+
+  // ── Anomaly Detection Agent — action collector ───────────────────────────
+  const executedActions: ExecutedAction[] = [];
+
   const canUseTool: CanUseTool = async (toolName, input, options) => {
-    // ───── Absent-mode short-circuit ─────
-    // Once a prior canUseTool in this task hit the 5-min timeout, the
-    // user is presumed away. Auto-allow silently for every subsequent
-    // request — no event pushed, no Promise dance, no UI noise. The
-    // user can still see the tool_use blocks in chat when they come
-    // back; we just skip the modal that would have stalled the task.
+    // ───── Tool Guard Agent ─────
+    // Runs FIRST — before absent-mode check. High-impact tools (financial,
+    // mass-destructive, mass-write) must ALWAYS get user confirmation, even
+    // when the user has been away for 5+ minutes. Absent-mode must never
+    // silently allow a "DELETE FROM orders" or "transfer_funds" call.
+    // Routine tools (reads, small writes) are allowed immediately and then
+    // fall through to the absent-mode short-circuit below so the task
+    // doesn't stall on every harmless file-read prompt.
+    const toolAssessment = assessTool(
+      toolName,
+      options.description ?? "",
+      input
+    );
+    if (toolAssessment.verdict === "allow") {
+      // Routine tool — safe to let absent-mode handle the rest silently.
+      info("ToolGuard auto-allowed:", { taskId, toolName, reason: toolAssessment.reason });
+      return { behavior: "allow", updatedInput: input };
+    }
+
+    // High-impact tool detected — record it and fall through to confirmation
+    // modal regardless of absent-mode state.
+    recordApproval(toolGuardHistory, toolName, toolAssessment, "unknown");
+    info("ToolGuard routing to confirmation modal:", {
+      taskId,
+      toolName,
+      impactCategory: toolAssessment.impactCategory,
+      reason: toolAssessment.reason,
+    });
+
+    // ───── Absent-mode short-circuit (routine tools only) ─────
+    // Only reached when Tool Guard already allowed the tool above.
+    // High-impact tools never reach this block — they always go to the modal.
     const taskAtStart = getTask(taskId);
     if (taskAtStart?.absentMode) {
       info("canUseTool auto-allowed (absent-mode):", {
@@ -1217,6 +1272,11 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       blockedPath: options.blockedPath,
       decisionReason: options.decisionReason,
       suggestions: options.suggestions,
+      // Tool Guard enrichment — tells the frontend this is a high-impact
+      // confirmation, not a routine SDK permission gate.
+      toolGuardReason: toolAssessment.reason,
+      toolGuardImpactCategory: toolAssessment.impactCategory,
+      toolGuardActionSummary: toolAssessment.actionSummary,
     };
     info("SDK canUseTool fired:", {
       taskId,
@@ -1229,38 +1289,49 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     });
     pushEvent(taskId, { type: "permission_request", data: payload });
 
-    // ───── 5-min auto-allow timer ─────
-    // If the user doesn't answer within PERMISSION_WAIT_MS, resolve
-    // the Promise with allow + flip the task into absent-mode so the
-    // REST of the task runs without further prompts. Also push a
-    // `permission_resolved` event so any open frontend modal can
-    // dismiss itself when the user reattaches later.
-    const timeoutHandle = setTimeout(() => {
-      if (!openPermissions.has(id)) return; // already resolved
-      info("canUseTool auto-allow (5-min timeout):", {
+    // ───── Timeout strategy: high-impact vs routine ─────
+    //
+    // High-impact tools (Tool Guard flagged): NO timeout — wait forever
+    // until the user explicitly decides. Auto-allow would defeat the entire
+    // purpose of the guard. The task stays paused indefinitely; only the
+    // user's Allow/Deny click (or an explicit Stop) can unblock it.
+    //
+    // Routine SDK-gated tools: keep the original 5-min auto-allow so long
+    // unattended runs (e.g. E2E test suites) don't stall on every file read.
+    const isHighImpact = toolAssessment.impactCategory !== "routine";
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    if (!isHighImpact) {
+      timeoutHandle = setTimeout(() => {
+        if (!openPermissions.has(id)) return;
+        info("canUseTool auto-allow (5-min timeout):", {
+          taskId,
+          id,
+          toolName,
+          toolUseId: options.toolUseID,
+        });
+        setTaskAbsentMode(taskId, true);
+        autoAllowPending(id);
+        openPermissions.delete(id);
+        pushEvent(taskId, {
+          type: "permission_resolved",
+          data: { id, decision: "auto-allow", reason: "user-absent-timeout" },
+        });
+      }, PERMISSION_WAIT_MS);
+    } else {
+      info("canUseTool waiting indefinitely (high-impact tool):", {
         taskId,
         id,
         toolName,
-        toolUseId: options.toolUseID,
+        impactCategory: toolAssessment.impactCategory,
       });
-      setTaskAbsentMode(taskId, true);
-      autoAllowPending(id);
-      openPermissions.delete(id);
-      pushEvent(taskId, {
-        type: "permission_resolved",
-        data: {
-          id,
-          decision: "auto-allow",
-          reason: "user-absent-timeout",
-        },
-      });
-    }, PERMISSION_WAIT_MS);
+    }
 
     const onAbort = () => {
       if (denyPending(id, "Aborted by user")) {
         openPermissions.delete(id);
       }
-      clearTimeout(timeoutHandle);
+      if (timeoutHandle) clearTimeout(timeoutHandle);
     };
     options.signal.addEventListener("abort", onAbort, { once: true });
     try {
@@ -1268,7 +1339,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       openPermissions.delete(id);
       return result;
     } finally {
-      clearTimeout(timeoutHandle);
+      if (timeoutHandle) clearTimeout(timeoutHandle);
       options.signal.removeEventListener("abort", onAbort);
     }
   };
@@ -1285,6 +1356,10 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       resume: sessionId ?? null,
     });
 
+    // Prepend Intent Guard's clarification prefix so the agent follows
+    // the user's chosen interpretation (e.g. "query only" vs "update all").
+    const effectiveMessage = promptPrefix + message;
+
     const promptInput =
       attachments && attachments.length > 0
         ? (async function* () {
@@ -1294,7 +1369,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
               message: {
                 role: "user" as const,
                 content: [
-                  { type: "text" as const, text: message },
+                  { type: "text" as const, text: effectiveMessage },
                   ...attachments.map((a) => ({
                     type: "image" as const,
                     source: {
@@ -1312,7 +1387,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
               session_id: sessionId ?? "",
             };
           })()
-        : message;
+        : effectiveMessage;
 
     const proxyContext = buildProxyContext();
     const completionContext = buildCompletionVerificationContext();
@@ -1357,7 +1432,9 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     // canUseTool above become dead code under this override (canUseTool
     // is never called). Kept intact so flipping back to the asked-flow
     // is a one-line change.
-    const FORCE_BYPASS_PERMISSIONS = true;
+    // Tool Guard + Intent Guard are now active — permissions must flow
+    // through canUseTool so the guards can intercept.
+    const FORCE_BYPASS_PERMISSIONS = false;
     const effectivePermissionMode = FORCE_BYPASS_PERMISSIONS
       ? ("bypassPermissions" as const)
       : permissionMode;
@@ -1394,6 +1471,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
     let detectedSessionId: string | null = sessionId ?? null;
     let messageCount = 0;
+    let finalAssistantText = "";
     for await (const sdkMessage of response) {
       pushEvent(taskId, { type: "claude_json", data: sdkMessage });
       const msg = sdkMessage as unknown as {
@@ -1443,7 +1521,15 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       if (Array.isArray(content)) {
         for (const block of content) {
           const t = block.type as string | undefined;
-          if (t === "tool_use") {
+          if (t === "text") {
+            // Collect final assistant response for Anomaly Detection
+            finalAssistantText = String(block.text ?? "");
+          } else if (t === "tool_use") {
+            // Anomaly Detection: collect every tool execution
+            executedActions.push({
+              toolName: String(block.name ?? ""),
+              input: (block.input as Record<string, unknown>) ?? {},
+            });
             info("SDK tool_use:", {
               taskId,
               name: block.name,
@@ -1473,6 +1559,14 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
                 .filter(Boolean)
                 .join("\n");
             }
+            // Anomaly Detection: attach result summary + error flag to the
+            // matching executed action (matched by position — tool_result
+            // immediately follows its tool_use in the content array).
+            const lastAction = executedActions[executedActions.length - 1];
+            if (lastAction) {
+              lastAction.resultSummary = txt.slice(0, 500);
+              lastAction.isError = isErr;
+            }
             if (isErr) {
               warn("SDK tool_result ERROR:", {
                 taskId,
@@ -1493,6 +1587,23 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
     if (detectedSessionId) {
       try { recordSession(detectedSessionId, safeCwd ?? null, messageCount); } catch { /* ignore */ }
+    }
+
+    // ── Anomaly Detection Agent ───────────────────────────────────────────
+    // Runs silently after all tool calls are done. Compares what actually
+    // happened against the user's captured intent (if Intent Guard ran).
+    // Only pushes an event when severity is "low" or "high" — stays silent
+    // on clean runs so the user sees no noise for routine tasks.
+    if (executedActions.length > 0) {
+      const task = getTask(taskId);
+      const anomalyReport = runAnomalyDetection(
+        task?.capturedIntent ?? null,
+        executedActions,
+        finalAssistantText
+      );
+      if (anomalyReport.severity !== "none") {
+        pushEvent(taskId, { type: "anomaly_alert", data: anomalyReport });
+      }
     }
 
     pushEvent(taskId, { type: "done" });

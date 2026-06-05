@@ -12,22 +12,20 @@ export interface StreamResponse {
     | "done"
     | "aborted"
     | "permission_request"
-    // Companion to `permission_request`: pushed when a pending permission
-    // is resolved server-side WITHOUT a user decision (5-min auto-allow
-    // timeout, future task-aborts, etc.). Frontend uses this to close
-    // any stale modal that was opened by the original `permission_request`
-    // — the SDK has already moved on. data: { id, decision, reason }.
     | "permission_resolved"
-    // Live token-usage update for the chat header's CompactRing — emitted
-    // whenever the SDK reports a new usage block (assistant turn or final
-    // result). `data` shape: { inputTokens, outputTokens }.
     | "token_usage"
-    // Emitted every ~15s while the SDK is busy (model thinking) or waiting
-    // on a permission decision. Pure side-effect: keeps the HTTP stream
-    // alive past proxy idle timeouts (Traefik / Cloudflare / nginx all
-    // default to ~60s) so the frontend doesn't see a spurious disconnect.
-    // Frontend's stream parser ignores it.
-    | "heartbeat";
+    | "heartbeat"
+    // Intent Guard Agent: fires before query() when the user's message is
+    // ambiguous. data: IntentGuardRequestPayload. Frontend shows a two-option
+    // clarification modal; user's choice is POSTed to /api/intent-guard/:id.
+    | "intent_guard_request"
+    // Companion to intent_guard_request: resolved server-side (auto-resolved
+    // on timeout or task abort). data: { id, choice: "narrow"|"broad"|"auto" }.
+    | "intent_guard_resolved"
+    // Anomaly Detection Agent: fires after all tools complete when the
+    // executed actions don't match the user's captured intent.
+    // data: AnomalyAlertPayload.
+    | "anomaly_alert";
   data?: unknown;
   error?: string;
 }

@@ -34,6 +34,7 @@ import {
 import { handleEvents } from "./handlers/events.js";
 import { handleInstallPack } from "./handlers/packs.js";
 import { handlePermissionDecision } from "./handlers/permission.js";
+import { handleIntentGuardDecision } from "./handlers/intentGuard.js";
 import {
   handleListServices,
   handleRegisterService,
@@ -134,6 +135,10 @@ export function createApp(config: AppConfig) {
   // Permission decision bridge — frontend posts here to resolve a
   // pending canUseTool callback inside an in-flight chat request.
   app.post("/api/permission/:id", handlePermissionDecision);
+
+  // Intent Guard decision bridge — frontend posts the user's chosen
+  // interpretation (narrow/broad) before the SDK query starts.
+  app.post("/api/intent-guard/:id", handleIntentGuardDecision);
 
   app.get("/api/health", (c: Context) => c.json({ status: "ok", debug: config.debug }));
 

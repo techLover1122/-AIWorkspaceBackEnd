@@ -1,5 +1,6 @@
 import type { StreamResponse } from "../types.js";
 import { info, warn } from "./logger.js";
+import type { CapturedIntent } from "../middleware/intentGuardAgent.js";
 
 export type TaskStatus = "running" | "done" | "error" | "aborted";
 
@@ -36,6 +37,9 @@ export interface Task {
    *  don't want the task to stall on every tool call. Resets to false
    *  only when a brand-new task starts (per-task scope). */
   absentMode: boolean;
+  /** Set by Intent Guard Agent once the user clarifies their intent.
+   *  Passed to Anomaly Detection Agent at the end of the task. */
+  capturedIntent: CapturedIntent | null;
 }
 
 const tasks = new Map<string, Task>();
@@ -73,6 +77,7 @@ export function createTask(opts: {
     abortController: opts.abortController,
     byteEstimate: 0,
     absentMode: false,
+    capturedIntent: null,
   };
   tasks.set(opts.taskId, task);
   info("Task created:", {
@@ -90,6 +95,12 @@ export function setTaskAbsentMode(taskId: string, value: boolean): void {
   if (task.absentMode === value) return;
   task.absentMode = value;
   info("Task absent-mode:", { taskId, value });
+}
+
+export function setTaskCapturedIntent(taskId: string, intent: CapturedIntent): void {
+  const task = tasks.get(taskId);
+  if (!task) return;
+  task.capturedIntent = intent;
 }
 
 export function getTask(taskId: string): Task | undefined {

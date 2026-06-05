@@ -45,6 +45,12 @@ export type PermissionRequestPayload = {
   blockedPath?: string;
   decisionReason?: string;
   suggestions?: PermissionUpdate[];
+  /** Tool Guard Agent enrichment — present when this permission was
+   *  triggered because the tool was classified as high-impact rather
+   *  than because the SDK's own permission gate fired. */
+  toolGuardReason?: string;
+  toolGuardImpactCategory?: string;
+  toolGuardActionSummary?: string;
 };
 
 export function createPendingPermission(args: {

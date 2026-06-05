@@ -1,0 +1,7 @@
+[36m[ai-ide-backend][0m SQLite database ready at C:\Users\SPIDI\.ai-ide\data.sqlite
+[36m[ai-ide-backend][0m 🔍 Trying 6 Claude CLI candidate(s)…
+[36m[ai-ide-backend][0m [33m[DEBUG][0m Claude CLI candidate "C:\Program Files\nodejs\node_modules\@anthropic-ai\claude-code\bin\claude.exe" → 2.1.141 (Claude Code)
+[36m[ai-ide-backend][0m ✅ Claude CLI: C:\Program Files\nodejs\node_modules\@anthropic-ai\claude-code\bin\claude.exe (2.1.141 (Claude Code))
+[36m[ai-ide-backend][0m [terminal] WebSocket route mounted at /api/terminal
+[36m[ai-ide-backend][0m Server running at http://127.0.0.1:8090
+[36m[ai-ide-backend][0m Debug mode: false
