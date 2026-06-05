@@ -395,22 +395,40 @@ WA_STATE_DIR="/var/lib/ai-ide/whatsapp"
 if [ ! -d "$WA_SRC" ]; then
   log "WARN: $WA_SRC not found — skipping WhatsApp sidecar (older backend checkout?)"
 else
-  # 1. Ensure Go is installed (apt's `golang` is fine — we don't need
-  #    the very latest). Cached on subsequent re-runs.
-  if ! command -v go >/dev/null 2>&1; then
-    log "Installing Go toolchain"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends golang-go
+  # 1. Install Go from the official tarball. Ubuntu's apt golang-go
+  #    package is way behind (1.18 on 22.04, 1.22 on 24.04) and
+  #    whatsmeow upstream pins go >= 1.25, so apt is a dead end.
+  #    Tarball install is reproducible and survives re-runs (just
+  #    re-extracts over the same /usr/local/go directory).
+  GO_VER=1.25.5
+  if ! /usr/local/go/bin/go version 2>/dev/null | grep -qE "go${GO_VER}"; then
+    log "Installing Go ${GO_VER} to /usr/local/go"
+    curl -fsSL "https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go.tar.gz
+    rm -f /tmp/go.tar.gz
+    if ! grep -q '/usr/local/go/bin' /etc/profile.d/go.sh 2>/dev/null; then
+      echo 'export PATH=/usr/local/go/bin:$PATH' > /etc/profile.d/go.sh
+      chmod 644 /etc/profile.d/go.sh
+    fi
+  fi
+  export PATH=/usr/local/go/bin:$PATH
+
+  # 2. CGO toolchain — go-sqlite3 builds C source, so gcc must exist.
+  if ! dpkg -s build-essential >/dev/null 2>&1; then
+    log "Installing build-essential for CGO"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential
   fi
 
-  # 2. Build the sidecar binary as the workspace user (so the module
+  # 3. Build the sidecar binary as the workspace user (so the module
   #    cache lives under ~/.cache/go-build, not root's). The output
   #    binary itself is installed system-wide.
   log "Building ai-ide-whatsapp sidecar"
-  as_user bash -lc "cd '$WA_SRC' && GOFLAGS=-mod=mod go build -o /tmp/ai-ide-whatsapp ."
+  as_user bash -lc "export PATH=/usr/local/go/bin:\$PATH && cd '$WA_SRC' && GOFLAGS=-mod=mod CGO_ENABLED=1 go build -o /tmp/ai-ide-whatsapp ."
   install -m 755 /tmp/ai-ide-whatsapp "$WA_BIN"
   rm -f /tmp/ai-ide-whatsapp
 
-  # 3. Generate the shared auth token once. Idempotent — if a token
+  # 4. Generate the shared auth token once. Idempotent — if a token
   #    already exists in /etc/workspace.env we keep it (otherwise an
   #    existing paired session would be locked out after a re-run).
   if ! grep -q '^WHATSAPP_AUTH_TOKEN=' /etc/workspace.env 2>/dev/null; then
@@ -426,12 +444,12 @@ else
     log "WHATSAPP_AUTH_TOKEN already present in /etc/workspace.env — leaving it"
   fi
 
-  # 4. Session store dir owned by the workspace user so the sidecar can
+  # 5. Session store dir owned by the workspace user so the sidecar can
   #    write the sqlite db without sudo.
   mkdir -p "$WA_STATE_DIR"
   chown -R "$TARGET_USER:$TARGET_USER" "$WA_STATE_DIR"
 
-  # 5. systemd unit. Loads /etc/workspace.env so WHATSAPP_AUTH_TOKEN
+  # 6. systemd unit. Loads /etc/workspace.env so WHATSAPP_AUTH_TOKEN
   #    propagates here. Bound to localhost only.
   cat > /etc/systemd/system/ai-ide-whatsapp.service <<EOF
 [Unit]
