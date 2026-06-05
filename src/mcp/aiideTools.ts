@@ -133,7 +133,7 @@ export const openTabTool = tool(
 
 export const registerServiceTool = tool(
   "register_service",
-  "Register a TCP port in this workspace as a public service. Returns the public domain URL the user's browser can reach. Use this BEFORE writing any code that the browser needs to fetch from a port other than the three defaults (3000=frontend, 8090=api, 8080=ide). Idempotent — calling twice with the same port returns the same URL. If you don't pass `name`, the subdomain becomes `port-<port>`.",
+  "Register a TCP port in this workspace as a public service. Returns the public domain URL the user's browser can reach. Use this BEFORE writing any code that the browser needs to fetch from a port other than the three defaults (3000=frontend, 8090=api, 8080=ide). Idempotent — calling twice with the same port returns the same URL. If you don't pass `name`, the subdomain becomes `port-<port>`. REQUIRED before calling: make sure the watchdog (ai-ide-watchdog.service) will be able to restart this service when it dies. It looks for, in order: `~/.ai-ide/services/<name>.sh` recipe → `<name>.service` systemd unit → docker container named `<name>`. For Claude-started dev servers, that means writing the tmux recipe FIRST (see the persistence-context section — Pattern A). The recipe filename MUST equal the `name` you pass here (or `port-<port>` if you omit `name`). Mismatch or missing recipe = no auto-restart, no boot recovery, service goes down with the chat session.",
   {
     port: z
       .number()
