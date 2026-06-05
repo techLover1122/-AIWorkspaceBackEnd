@@ -84,7 +84,12 @@ function whichCommand(): string[] {
 async function validate(candidate: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(candidate, ["--version"], {
-      timeout: 5000,
+      // The @anthropic-ai/claude-code wrapper does a one-time per-user binary
+      // extract on first invocation that can take ~30s. cloud-init.sh warms
+      // it for the ubuntu user at provision time, but on cold boots from
+      // older snapshots (or any host where the warm-up was skipped) we need
+      // headroom or detection false-fails and chat goes dead.
+      timeout: 45000,
     });
     const version = stdout.trim();
     if (version) {
