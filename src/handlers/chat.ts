@@ -1719,7 +1719,23 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
         ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}),
         ...(appendedSystem ? { appendSystemPrompt: appendedSystem } : {}),
         includePartialMessages: true,
-        settings: { autoCompactEnabled: false },
+        // ───── Auto-compaction: ENABLED ─────
+        //
+        // Previously hard-disabled (`autoCompactEnabled: false`), which is
+        // exactly why the chat panel kept dying with "Prompt is too long":
+        // a resumed session's transcript grows past the model's context
+        // window and, with compaction off, the SDK has no way to shrink it
+        // — so the very next message (even a one-word "go" / "no") overflows
+        // and the turn errors out before it starts.
+        //
+        // With this true, the SDK auto-compacts (summarize older turns, keep
+        // the recent tail) BEFORE a request would exceed the window, both
+        // mid-conversation and pre-flight on resume. That self-heals an
+        // already-bloated session: the next turn compacts first, then runs.
+        //
+        // `settings` is the highest-priority ("flag settings") layer, so this
+        // wins over any project/user settings.json that might disable it.
+        settings: { autoCompactEnabled: true },
       },
     });
 
@@ -1932,7 +1948,20 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     } else {
       const msgText = err instanceof Error ? err.message : String(err);
       logError("Chat task error:", msgText);
-      pushEvent(taskId, { type: "error", error: msgText });
+      // "Prompt is too long" means the resumed transcript overflowed the
+      // model's context window. With autoCompactEnabled now true the SDK
+      // compacts pre-flight, so this should be rare — but if a single
+      // session has ballooned past what even compaction can fit, the raw
+      // SDK string is cryptic and leaves the user stuck. Surface an
+      // actionable message instead.
+      const isPromptTooLong = /prompt is too long/i.test(msgText);
+      const userFacing = isPromptTooLong
+        ? "This conversation grew too large for the model's context window. " +
+          "Auto-compaction is enabled and normally shrinks it automatically, " +
+          "but this session is big enough that it couldn't recover. Start a " +
+          "new chat to continue — your files and work are unaffected."
+        : msgText;
+      pushEvent(taskId, { type: "error", error: userFacing });
       setTaskStatus(taskId, "error");
     }
   } finally {
