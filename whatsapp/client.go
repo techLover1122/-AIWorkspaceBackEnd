@@ -157,22 +157,23 @@ func isDeletedDeviceErr(err error) bool {
 // IsRegistered() is false, so a fresh QR/phone pairing can start. Safe
 // to call from a goroutine; it swaps w.client under the mutex.
 func (w *waClient) resetSession() error {
-	if w.client != nil {
-		if w.client.IsConnected() {
-			w.client.Disconnect()
-		}
-		// Best-effort: drop the device row. whatsmeow may have already
-		// deleted it during logout, in which case this is a harmless no-op.
-		if w.client.Store != nil && w.client.Store.ID != nil {
-			_ = w.client.Store.Delete(w.ctx)
+	if w.client != nil && w.client.IsConnected() {
+		w.client.Disconnect()
+	}
+	// Purge EVERY device row, not just the current one. This is the fix for
+	// the recurring "invalid use of deleted device": GetFirstDevice could
+	// otherwise hand back a lingering / half-deleted row, and reusing it
+	// re-poisons the client on every pairing. Deleting all rows guarantees
+	// the store is truly empty before we build a fresh device.
+	if devices, derr := w.container.GetAllDevices(w.ctx); derr == nil {
+		for _, d := range devices {
+			_ = w.container.DeleteDevice(w.ctx, d)
 		}
 	}
-	// After deletion the store is empty, so GetFirstDevice hands back a
-	// brand-new blank device — a clean slate for the next pairing.
-	device, err := w.container.GetFirstDevice(w.ctx)
-	if err != nil {
-		return fmt.Errorf("reset: get fresh device: %w", err)
-	}
+	// NewDevice() always returns a brand-new, never-registered device.
+	// Unlike GetFirstDevice it can never return a deleted/poisoned row, so
+	// the next pairing always starts from a guaranteed-clean slate.
+	device := w.container.NewDevice()
 	clientLog := waLog.Stdout("Client", "WARN", true)
 	newCli := whatsmeow.NewClient(device, clientLog)
 	newCli.AddEventHandler(w.handleEvent)
@@ -493,7 +494,25 @@ func (w *waClient) handleEvent(evt interface{}) {
 		// makes every later Connect() fail with "invalid use of deleted
 		// device" forever. Purge it and start a fresh QR off the event
 		// loop so the user just re-scans; no manual session reset needed.
+		//
+		// Log the full event so the *reason* is visible in
+		// `journalctl -u ai-ide-whatsapp` — this tells a genuine unlink
+		// apart from a server-side version removal (whatsmeow #984) or an
+		// expiry, which is the difference between "user did it" and "we
+		// need to update whatsmeow".
+		fmt.Printf("whatsapp: LoggedOut %+v — purging session, offering fresh QR\n", v)
 		go w.recoverFromLogout()
+	case *events.StreamReplaced:
+		// Another client connected with THIS device's credentials. If this
+		// fires without the user opening WhatsApp Web elsewhere, it means a
+		// second sidecar instance is running against the same session.db —
+		// a deployment bug that also shows up as device removals.
+		fmt.Printf("whatsapp: StreamReplaced — another client took over this device (duplicate sidecar?)\n")
+	case *events.ConnectFailure:
+		// Surfaces the server's reason for refusing the connection (e.g.
+		// client-outdated), which is the upstream trigger for repeated
+		// device removals.
+		fmt.Printf("whatsapp: ConnectFailure %+v\n", v)
 	}
 }
 
