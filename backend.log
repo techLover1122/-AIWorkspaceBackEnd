@@ -5,3 +5,5 @@
 [36m[ai-ide-backend][0m [terminal] WebSocket route mounted at /api/terminal
 [36m[ai-ide-backend][0m Server running at http://127.0.0.1:8090
 [36m[ai-ide-backend][0m Debug mode: false
+[36m[ai-ide-backend][0m [33m[WARN][0m PROXY_ROUTER_URL / USER_ID not set — service registration skipped
+[36m[ai-ide-backend][0m [33m[WARN][0m Metadata extract failed for http://localhost:5174/: fetch failed

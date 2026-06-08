@@ -595,6 +595,120 @@ function buildCompletionVerificationContext(): string {
 }
 
 /**
+ * Persistent-memory context. The user asked that the chat panel maintain
+ * its OWN memory automatically — recall it at the start of a turn and
+ * save/update it at the end of EVERY turn, with the same discipline the
+ * E2E rule applies to testing — so they never have to repeat a preference,
+ * decision, or fact they've already given.
+ *
+ * The store is a flat directory of one-fact-per-file markdown notes plus a
+ * MEMORY.md index, living OUTSIDE any project tree so it survives across
+ * projects, sessions, and EC2 rebuilds of a given workspace. Modeled on
+ * the harness's own auto-memory so the format is familiar.
+ */
+function buildMemoryContext(): string {
+  return [
+    "# Persistent memory — recall + UPDATE every turn (a CONTRACT, like E2E)",
+    "",
+    "## ⛔ HARD RULE — read this every turn",
+    "",
+    "The user has explicitly asked that you keep your OWN memory, the same",
+    "way you run E2E after every prompt: **recall at the start of a turn,",
+    "save/update at the end of every turn.** The whole point is that they",
+    "NEVER have to tell you the same thing twice — a preference, a decision,",
+    "a name, a path, a correction. Forgetting something they already told",
+    "you is treated as the same kind of trust-break as skipping E2E.",
+    "",
+    "Do this silently. Don't narrate it or ask permission to remember —",
+    "at most ONE short line when you persist something material (e.g.",
+    "\"(noted: you prefer pnpm)\"). Never turn it into a conversation.",
+    "",
+    "## The store",
+    "",
+    "A flat directory, OUTSIDE any project tree so it persists across",
+    "projects and sessions:",
+    "",
+    "```",
+    "~/.ai-ide/memory/",
+    "├── MEMORY.md            # the index — one line per memory, loaded first",
+    "└── <slug>.md            # one fact per file, with frontmatter",
+    "```",
+    "",
+    "Create the directory on first use: `mkdir -p ~/.ai-ide/memory`.",
+    "",
+    "Each fact file:",
+    "",
+    "```markdown",
+    "---",
+    "name: <short-kebab-case-slug>",
+    "description: <one-line summary — used to decide relevance on recall>",
+    "metadata:",
+    "  type: user | preference | project | reference",
+    "---",
+    "",
+    "<the fact. For preference/project facts, add a short **Why:** line so a",
+    "future turn knows the reasoning. Link related notes with [[their-slug]].>",
+    "```",
+    "",
+    "`MEMORY.md` holds ONLY an index — one bullet per fact, never the fact",
+    "body: `- [Title](slug.md) — <hook>`.",
+    "",
+    "## Step 1 — RECALL (start of every turn, before you act)",
+    "",
+    "Read the index so you act on what you already know:",
+    "",
+    "```bash",
+    "cat ~/.ai-ide/memory/MEMORY.md 2>/dev/null || true",
+    "```",
+    "",
+    "Then `cat` any fact file whose index hook looks relevant to THIS",
+    "request. Apply what you find — if a note says the user prefers pnpm,",
+    "use pnpm without asking; if a note records a project decision, honor",
+    "it. A recalled fact reflects what was true when written — if it names a",
+    "file/flag/path, sanity-check it still exists before relying on it.",
+    "",
+    "## Step 2 — CAPTURE / UPDATE (end of every turn, before \"done\")",
+    "",
+    "Before you wrap up, ask: did this turn reveal anything DURABLE that a",
+    "future turn would need and couldn't re-derive? If yes, write or update",
+    "a fact file AND its one-line entry in MEMORY.md. Specifically capture:",
+    "",
+    "- **user / preferences** — tools, stack, style, workflow, how they want",
+    "  you to behave (\"always pnpm\", \"don't add comments\", \"deploy via X\").",
+    "- **project** — goals, constraints, decisions, current state / next-up",
+    "  that are NOT obvious from the code or git history. Convert relative",
+    "  dates to absolute (\"today\" → the actual date).",
+    "- **corrections / feedback** — anything the user pushed back on. Record",
+    "  the correction AND the why, so you don't repeat the mistake.",
+    "- **reference** — pointers to URLs, dashboards, credentials *locations*",
+    "  (never the secret value itself), ticket IDs.",
+    "",
+    "## Step 3 — keep it clean",
+    "",
+    "- Before writing, scan MEMORY.md for an existing note that already",
+    "  covers it — UPDATE that file instead of creating a near-duplicate.",
+    "- If a fact turns out wrong or outdated, DELETE its file and its index",
+    "  line. Stale memory is worse than none.",
+    "- One fact per file. Keep each note tight.",
+    "",
+    "## Don't save",
+    "",
+    "- Things derivable from the repo (code structure, what a function does,",
+    "  git history) — re-read the source instead.",
+    "- Secret VALUES (tokens, passwords, keys). Record where they live, not",
+    "  what they are.",
+    "- One-off details that only matter to the current turn.",
+    "",
+    "If the user says \"remember that …\" — always persist it immediately.",
+    "If they say \"forget …\" — delete the matching note and its index line.",
+    "",
+    "This rule is ADDITIVE — it does not replace the E2E / verification",
+    "contract. A turn updates memory AND runs its checks; neither excuses",
+    "skipping the other.",
+  ].join("\n");
+}
+
+/**
  * Playwright E2E-testing context appended to every chat request's system
  * prompt. Tells the model that a long-running `ai-ide-playwright` Docker
  * container is available with Playwright + Chromium + Firefox + WebKit
@@ -1634,6 +1748,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
     const proxyContext = buildProxyContext();
     const completionContext = buildCompletionVerificationContext();
+    const memoryContext = buildMemoryContext();
     const playwrightContext = buildPlaywrightContext();
     const desktopBrowserContext = PLAYWRIGHT_MCP_URL ? buildDesktopBrowserContext() : null;
     const hyperframesContext = buildHyperframesContext();
@@ -1652,6 +1767,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       desktopBrowserContext,
       playwrightContext,
       completionContext,
+      memoryContext,
       hyperframesContext,
       persistenceContext,
       codeOrgContext,
