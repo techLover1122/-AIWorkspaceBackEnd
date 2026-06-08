@@ -20,7 +20,8 @@ export type ClientEvent =
       description: string;
       hasInstall: boolean;
       installedAt: string;
-    };
+    }
+  | { type: "task_started"; taskId: string; origin: string };
 
 type Subscriber = (e: ClientEvent) => void;
 

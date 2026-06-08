@@ -29,6 +29,7 @@ import { autoAllowPending, denyPending, isPending } from "../handlers/permission
 import type { PermissionRequestPayload } from "../handlers/permission.js";
 import { isUserPresent, onPresenceChange } from "./presenceTracker.js";
 import { getWhatsAppForwardingEnabled } from "./userPrefs.js";
+import { publishEvent } from "../handlers/events.js";
 
 const SIDECAR_URL = process.env.WHATSAPP_SIDECAR_URL ?? "http://127.0.0.1:8091";
 const AUTH_TOKEN = process.env.WHATSAPP_AUTH_TOKEN ?? "";
@@ -644,7 +645,10 @@ async function startChatTurn(args: {
       );
       return { taskId: requestId };
     }
-    info("WhatsApp → /api/chat started:", { requestId });
+    const json = (await res.json().catch(() => ({}))) as { taskId?: string };
+    const actualTaskId = json.taskId ?? requestId;
+    publishEvent({ type: "task_started", taskId: actualTaskId, origin: "whatsapp" });
+    info("WhatsApp → /api/chat started:", { requestId: actualTaskId });
   } catch (err) {
     warn("WhatsApp → /api/chat threw:", {
       err: err instanceof Error ? err.message : String(err),
