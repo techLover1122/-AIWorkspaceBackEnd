@@ -1,6 +1,8 @@
 import { Context } from "hono";
 import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ChatRequest } from "../types.js";
 import { info, warn, error as logError } from "../utils/logger.js";
 import { recordSession } from "../utils/db.js";
@@ -601,10 +603,12 @@ function buildCompletionVerificationContext(): string {
  * E2E rule applies to testing — so they never have to repeat a preference,
  * decision, or fact they've already given.
  *
- * The store is a flat directory of one-fact-per-file markdown notes plus a
- * MEMORY.md index, living OUTSIDE any project tree so it survives across
- * projects, sessions, and EC2 rebuilds of a given workspace. Modeled on
- * the harness's own auto-memory so the format is familiar.
+ * The store is Claude Code's NATIVE user-memory file, ~/.claude/CLAUDE.md.
+ * It is auto-loaded into context at the start of every session (so recall
+ * is automatic and reliable) and is the file the agent already edits via
+ * its built-in memory affordance. We deliberately use this one canonical
+ * file — visible and editable in one place — instead of a parallel store
+ * the model tends to ignore in favor of CLAUDE.md.
  */
 function buildMemoryContext(): string {
   return [
@@ -612,84 +616,62 @@ function buildMemoryContext(): string {
     "",
     "## ⛔ HARD RULE — read this every turn",
     "",
-    "The user has explicitly asked that you keep your OWN memory, the same",
-    "way you run E2E after every prompt: **recall at the start of a turn,",
-    "save/update at the end of every turn.** The whole point is that they",
-    "NEVER have to tell you the same thing twice — a preference, a decision,",
-    "a name, a path, a correction. Forgetting something they already told",
-    "you is treated as the same kind of trust-break as skipping E2E.",
+    "The user asked you to keep your OWN memory, the same way you run E2E",
+    "after every prompt: recall what you already know, and save/update it",
+    "at the end of EVERY turn. The whole point is that they NEVER have to",
+    "tell you the same thing twice — a preference, a decision, a name, a",
+    "path, a correction. Forgetting something they already told you is the",
+    "same kind of trust-break as skipping E2E.",
     "",
     "Do this silently. Don't narrate it or ask permission to remember —",
     "at most ONE short line when you persist something material (e.g.",
     "\"(noted: you prefer pnpm)\"). Never turn it into a conversation.",
     "",
-    "## The store",
+    "A spoken \"Noted!\" / \"I'll keep that in mind\" is NOT memory. If you",
+    "acknowledge a durable fact, you MUST also WRITE it to",
+    "`~/.claude/CLAUDE.md` in the SAME turn — replying without writing is the",
+    "trust-break. \"Just note it\" / \"nothing else needed\" does NOT mean skip",
+    "saving; writing the file IS the note. The only time you may skip writing",
+    "is when the fact is already in CLAUDE.md or is genuinely transient.",
     "",
-    "A flat directory, OUTSIDE any project tree so it persists across",
-    "projects and sessions:",
+    "## Where memory lives",
     "",
-    "```",
-    "~/.ai-ide/memory/",
-    "├── MEMORY.md            # the index — one line per memory, loaded first",
-    "└── <slug>.md            # one fact per file, with frontmatter",
-    "```",
-    "",
-    "Create the directory on first use: `mkdir -p ~/.ai-ide/memory`.",
-    "",
-    "Each fact file:",
-    "",
-    "```markdown",
-    "---",
-    "name: <short-kebab-case-slug>",
-    "description: <one-line summary — used to decide relevance on recall>",
-    "metadata:",
-    "  type: user | preference | project | reference",
-    "---",
-    "",
-    "<the fact. For preference/project facts, add a short **Why:** line so a",
-    "future turn knows the reasoning. Link related notes with [[their-slug]].>",
-    "```",
-    "",
-    "`MEMORY.md` holds ONLY an index — one bullet per fact, never the fact",
-    "body: `- [Title](slug.md) — <hook>`.",
+    "Your memory is the file **`~/.claude/CLAUDE.md`** — Claude Code's native",
+    "user memory. It is AUTO-LOADED into your context at the start of every",
+    "session, so anything saved there you already know next time. This is the",
+    "single source of truth for cross-session memory — do NOT invent a",
+    "parallel store (no `~/.ai-ide/memory/`, no scratch files); everything",
+    "goes in this one file so the user has exactly one place to look.",
     "",
     "## Step 1 — RECALL (start of every turn, before you act)",
     "",
-    "Read the index so you act on what you already know:",
-    "",
-    "```bash",
-    "cat ~/.ai-ide/memory/MEMORY.md 2>/dev/null || true",
-    "```",
-    "",
-    "Then `cat` any fact file whose index hook looks relevant to THIS",
-    "request. Apply what you find — if a note says the user prefers pnpm,",
-    "use pnpm without asking; if a note records a project decision, honor",
-    "it. A recalled fact reflects what was true when written — if it names a",
-    "file/flag/path, sanity-check it still exists before relying on it.",
+    "`~/.claude/CLAUDE.md` is already in your context — honor it. If it says",
+    "the user prefers pnpm, use pnpm without asking; if it records a project",
+    "decision, follow it. A saved fact reflects what was true when written —",
+    "if it names a file/flag/path, sanity-check it still exists before",
+    "relying on it. (If for some reason it is NOT in context, run",
+    "`cat ~/.claude/CLAUDE.md` before acting.)",
     "",
     "## Step 2 — CAPTURE / UPDATE (end of every turn, before \"done\")",
     "",
-    "Before you wrap up, ask: did this turn reveal anything DURABLE that a",
-    "future turn would need and couldn't re-derive? If yes, write or update",
-    "a fact file AND its one-line entry in MEMORY.md. Specifically capture:",
+    "Before wrapping up, ask: did this turn reveal anything DURABLE a future",
+    "session would need and couldn't re-derive? If yes, write it into",
+    "`~/.claude/CLAUDE.md` (use your memory tool, or Edit the file directly).",
+    "Capture:",
     "",
-    "- **user / preferences** — tools, stack, style, workflow, how they want",
-    "  you to behave (\"always pnpm\", \"don't add comments\", \"deploy via X\").",
-    "- **project** — goals, constraints, decisions, current state / next-up",
-    "  that are NOT obvious from the code or git history. Convert relative",
-    "  dates to absolute (\"today\" → the actual date).",
-    "- **corrections / feedback** — anything the user pushed back on. Record",
-    "  the correction AND the why, so you don't repeat the mistake.",
-    "- **reference** — pointers to URLs, dashboards, credentials *locations*",
-    "  (never the secret value itself), ticket IDs.",
+    "- **preferences** — tools, stack, style, workflow, how they want you to",
+    "  behave (\"always pnpm\", \"don't add comments\", \"deploy via X\").",
+    "- **project facts** — goals, constraints, decisions, current state /",
+    "  next-up that are NOT obvious from the code or git history. Convert",
+    "  relative dates to absolute (\"today\" → the actual date).",
+    "- **corrections** — anything the user pushed back on, plus the why, so",
+    "  you don't repeat the mistake.",
+    "- **references** — URLs, dashboards, ticket IDs, and where credentials",
+    "  live (never the secret value itself).",
     "",
-    "## Step 3 — keep it clean",
-    "",
-    "- Before writing, scan MEMORY.md for an existing note that already",
-    "  covers it — UPDATE that file instead of creating a near-duplicate.",
-    "- If a fact turns out wrong or outdated, DELETE its file and its index",
-    "  line. Stale memory is worse than none.",
-    "- One fact per file. Keep each note tight.",
+    "Organize entries under clear `##` headings. UPDATE the matching section",
+    "instead of appending a near-duplicate; DELETE an entry that turns out",
+    "wrong (stale memory is worse than none). Keep entries tight.",
     "",
     "## Don't save",
     "",
@@ -699,8 +681,8 @@ function buildMemoryContext(): string {
     "  what they are.",
     "- One-off details that only matter to the current turn.",
     "",
-    "If the user says \"remember that …\" — always persist it immediately.",
-    "If they say \"forget …\" — delete the matching note and its index line.",
+    "If the user says \"remember that …\" — persist it immediately. If they",
+    "say \"forget …\" — delete the matching entry.",
     "",
     "This rule is ADDITIVE — it does not replace the E2E / verification",
     "contract. A turn updates memory AND runs its checks; neither excuses",
@@ -1470,6 +1452,151 @@ interface RunChatTaskArgs {
   origin?: ChatRequest["origin"];
 }
 
+// ── Deterministic post-turn memory capture ────────────────────────────────
+// The main agent can't be relied on to persist every durable fact — it often
+// just replies "noted" without writing the file. So after each turn we run a
+// CHEAP Haiku pass that DECIDES what's worth remembering, and THIS BACKEND
+// writes it to ~/.claude/CLAUDE.md (Claude Code's native, auto-loaded memory).
+// The model only judges; the file write is code, so capture can't be skipped.
+// Facts live in a delimited managed block so they stay separate from the
+// hand-curated parts of CLAUDE.md and dedupe cleanly.
+
+const MEMORY_FILE = join(homedir(), ".claude", "CLAUDE.md");
+const MEMORY_START = "<!-- ai-ide:auto-memory:start -->";
+const MEMORY_END = "<!-- ai-ide:auto-memory:end -->";
+
+function normalizeFact(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+/** Merge new fact bullets into the managed block. Returns the ones added. */
+function mergeMemoryFacts(facts: string[]): string[] {
+  let content = existsSync(MEMORY_FILE) ? readFileSync(MEMORY_FILE, "utf8") : "";
+  const sIdx = content.indexOf(MEMORY_START);
+  const eIdx = content.indexOf(MEMORY_END);
+  let existing: string[] = [];
+  if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {
+    existing = content
+      .slice(sIdx, eIdx)
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("- "));
+  }
+  const seen = new Set(existing.map((l) => normalizeFact(l.replace(/^-\s*/, ""))));
+  const contentNorm = normalizeFact(content);
+  const added: string[] = [];
+  for (const f of facts) {
+    const clean = f.trim().replace(/^[-*]\s*/, "").replace(/\s+/g, " ");
+    const n = normalizeFact(clean);
+    if (n.length < 4) continue;
+    if (seen.has(n)) continue;
+    // Already stated elsewhere in CLAUDE.md (e.g. a hand-written section) —
+    // don't duplicate it into the auto block.
+    if (contentNorm.includes(n)) continue;
+    seen.add(n);
+    added.push("- " + clean);
+  }
+  if (added.length === 0) return [];
+
+  const block = [
+    MEMORY_START,
+    "# Remembered preferences & facts (auto-captured)",
+    ...existing,
+    ...added,
+    MEMORY_END,
+  ].join("\n");
+
+  if (sIdx !== -1 && eIdx !== -1 && eIdx > sIdx) {
+    content = content.slice(0, sIdx) + block + content.slice(eIdx + MEMORY_END.length);
+  } else {
+    content = content.replace(/\s*$/, "") + "\n\n" + block + "\n";
+  }
+  writeFileSync(MEMORY_FILE, content, "utf8");
+  return added;
+}
+
+/**
+ * Run the cheap extraction pass over one finished turn and persist anything
+ * durable. Fire-and-forget — never throws into the caller.
+ */
+async function captureMemoryFromTurn(userText: string, assistantText: string): Promise<void> {
+  const u = (userText ?? "").trim();
+  // Skip trivial turns: permission replies, "continue", one-word acks.
+  if (u.length < 8) return;
+  if (u.length < 16 && /^(continue|yes|no|y|n|ok|okay|sure|stop|go|thanks)\b/i.test(u)) return;
+
+  const prompt = [
+    "From the single chat turn below, extract DURABLE facts worth remembering",
+    "across FUTURE sessions about THIS user or project. Output ONLY a JSON array",
+    "of short strings (each ≤ 14 words).",
+    "",
+    "INCLUDE: stable preferences (tools, stack, style, workflow), the user's",
+    "identity (name / role), explicit decisions, corrections they made, and",
+    "stable project facts not obvious from code or git.",
+    "EXCLUDE: one-off task details, transient state, secrets / tokens / keys, and",
+    "anything a future session could re-derive by reading the repo.",
+    "If nothing is durable, output exactly: []",
+    "",
+    "=== USER ===",
+    u.slice(0, 3000),
+    "",
+    "=== ASSISTANT ===",
+    (assistantText ?? "").slice(0, 3000),
+    "",
+    "JSON array only, no prose:",
+  ].join("\n");
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30_000);
+  let raw = "";
+  try {
+    const res = query({
+      prompt,
+      options: {
+        model: "claude-haiku-4-5",
+        abortController: ctrl,
+        ...(process.env.CLAUDE_PATH ? { pathToClaudeCodeExecutable: process.env.CLAUDE_PATH } : {}),
+        allowedTools: [],
+        includePartialMessages: false,
+      },
+    });
+    for await (const m of res) {
+      const mm = m as unknown as { type?: string; message?: { content?: Array<Record<string, unknown>> } };
+      if (mm.type === "assistant" && Array.isArray(mm.message?.content)) {
+        for (const block of mm.message!.content!) {
+          if (block.type === "text") raw += String(block.text ?? "");
+        }
+      }
+    }
+  } catch (err) {
+    warn("auto-memory: extraction query failed: " + (err instanceof Error ? err.message : String(err)));
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let facts: string[] = [];
+  try {
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (!match) return;
+    const parsed = JSON.parse(match[0]) as unknown;
+    if (!Array.isArray(parsed)) return;
+    facts = parsed.filter((x): x is string => typeof x === "string");
+  } catch {
+    return;
+  }
+  if (facts.length === 0) return;
+
+  try {
+    const added = mergeMemoryFacts(facts);
+    if (added.length > 0) {
+      info(`auto-memory: saved ${added.length} fact(s) to ~/.claude/CLAUDE.md`, { added });
+    }
+  } catch (err) {
+    warn("auto-memory: merge/write failed: " + (err instanceof Error ? err.message : String(err)));
+  }
+}
+
 /**
  * The background SDK runner. Spawned (not awaited) from handleChatRequest.
  * Pushes every event into the task registry instead of an HTTP stream —
@@ -2037,6 +2164,15 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
 
     pushEvent(taskId, { type: "done" });
     setTaskStatus(taskId, "done");
+
+    // ── Deterministic auto-memory ─────────────────────────────────────────
+    // Fire-and-forget: a cheap Haiku pass extracts durable facts from this
+    // turn and the backend writes them to ~/.claude/CLAUDE.md. Runs AFTER the
+    // done event so it never delays the user's reply. Skipped for WhatsApp-
+    // origin turns is unnecessary — preferences from any surface are worth
+    // keeping — so we run it for all completed turns.
+    void captureMemoryFromTurn(message, finalAssistantText);
+
     // Ping the user on WhatsApp with the agent's final text. WhatsApp-
     // originated turns fire the reply immediately (the friend who asked
     // is waiting); UI turns go through the three-trigger gate, with
