@@ -118,6 +118,14 @@ func (w *waClient) IsRegistered() bool {
 // Connect dials WhatsApp and starts receiving events for an already-
 // registered device. Returns an error if the device is unregistered —
 // callers should use BeginQRPairing instead.
+//
+// Self-healing: if the stored session points at a device WhatsApp has
+// already removed (e.g. the user deleted it from "Linked Devices", or
+// the server expired it), whatsmeow's Connect fails with "invalid use
+// of deleted device" and would stay stuck on every boot. We detect that
+// case, purge the poisoned session, and kick off a fresh QR pairing so
+// the user can simply re-scan — no manual session.db deletion ever
+// needed.
 func (w *waClient) Connect() error {
 	if !w.IsRegistered() {
 		return errors.New("device not registered — start pairing first")
@@ -125,7 +133,71 @@ func (w *waClient) Connect() error {
 	if w.client.IsConnected() {
 		return nil
 	}
-	return w.client.Connect()
+	err := w.client.Connect()
+	if isDeletedDeviceErr(err) {
+		if rerr := w.resetSession(); rerr != nil {
+			return fmt.Errorf("deleted-device recovery failed: %w", rerr)
+		}
+		// Surface a fresh QR in the background; the /qr poll picks it up.
+		go func() { _ = w.BeginQRPairing() }()
+		return nil
+	}
+	return err
+}
+
+// isDeletedDeviceErr reports whether an error is whatsmeow's
+// "invalid use of deleted device" — the signal that the local session
+// references a device WhatsApp no longer recognizes.
+func isDeletedDeviceErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "deleted device")
+}
+
+// resetSession purges the current (poisoned or logged-out) device and
+// rebuilds a clean, unregistered client in its place. After this call
+// IsRegistered() is false, so a fresh QR/phone pairing can start. Safe
+// to call from a goroutine; it swaps w.client under the mutex.
+func (w *waClient) resetSession() error {
+	if w.client != nil {
+		if w.client.IsConnected() {
+			w.client.Disconnect()
+		}
+		// Best-effort: drop the device row. whatsmeow may have already
+		// deleted it during logout, in which case this is a harmless no-op.
+		if w.client.Store != nil && w.client.Store.ID != nil {
+			_ = w.client.Store.Delete(w.ctx)
+		}
+	}
+	// After deletion the store is empty, so GetFirstDevice hands back a
+	// brand-new blank device — a clean slate for the next pairing.
+	device, err := w.container.GetFirstDevice(w.ctx)
+	if err != nil {
+		return fmt.Errorf("reset: get fresh device: %w", err)
+	}
+	clientLog := waLog.Stdout("Client", "WARN", true)
+	newCli := whatsmeow.NewClient(device, clientLog)
+	newCli.AddEventHandler(w.handleEvent)
+
+	w.mu.Lock()
+	w.client = newCli
+	w.currentQR = ""
+	w.pairingCode = ""
+	w.qrActive = false
+	w.lastPairErr = ""
+	w.mu.Unlock()
+	return nil
+}
+
+// recoverFromLogout runs the deleted-device recovery off the whatsmeow
+// event loop (calling Disconnect/Connect inline from a handler can
+// deadlock), then immediately offers a fresh QR.
+func (w *waClient) recoverFromLogout() {
+	if err := w.resetSession(); err != nil {
+		w.mu.Lock()
+		w.lastPairErr = "session reset failed: " + err.Error()
+		w.mu.Unlock()
+		return
+	}
+	_ = w.BeginQRPairing()
 }
 
 // Status snapshots what the HTTP /status endpoint needs.
@@ -377,12 +449,12 @@ func (w *waClient) handleEvent(evt interface{}) {
 	case *events.Message:
 		w.handleMessage(v)
 	case *events.LoggedOut:
-		// User unlinked from their phone; we'll naturally lose the
-		// session and a re-pair is needed next time.
-		w.mu.Lock()
-		w.currentQR = ""
-		w.pairingCode = ""
-		w.mu.Unlock()
+		// The device was removed (from the phone's Linked Devices or by
+		// the server). The in-memory device is now poisoned — keeping it
+		// makes every later Connect() fail with "invalid use of deleted
+		// device" forever. Purge it and start a fresh QR off the event
+		// loop so the user just re-scans; no manual session reset needed.
+		go w.recoverFromLogout()
 	}
 }
 
