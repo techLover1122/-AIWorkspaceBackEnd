@@ -21,7 +21,7 @@ export type ClientEvent =
       hasInstall: boolean;
       installedAt: string;
     }
-  | { type: "task_started"; taskId: string; origin: string };
+  | { type: "task_started"; taskId: string; origin: string; userMessage?: string };
 
 type Subscriber = (e: ClientEvent) => void;
 

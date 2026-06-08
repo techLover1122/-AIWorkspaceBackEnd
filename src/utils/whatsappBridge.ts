@@ -698,7 +698,15 @@ async function startChatTurn(args: {
     }
     const json = (await res.json().catch(() => ({}))) as { taskId?: string };
     const actualTaskId = json.taskId ?? requestId;
-    publishEvent({ type: "task_started", taskId: actualTaskId, origin: "whatsapp" });
+    // Carry the user's prompt text so the desktop panel can render it as
+    // a "you" bubble — otherwise a WhatsApp-originated turn shows only the
+    // agent's reply with no record of what the user actually asked.
+    publishEvent({
+      type: "task_started",
+      taskId: actualTaskId,
+      origin: "whatsapp",
+      userMessage: args.message,
+    });
     info("WhatsApp → /api/chat started:", { requestId: actualTaskId });
   } catch (err) {
     warn("WhatsApp → /api/chat threw:", {
