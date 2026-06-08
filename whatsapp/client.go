@@ -307,59 +307,83 @@ func (w *waClient) BeginQRPairing() error {
 	w.lastPairErr = ""
 	w.mu.Unlock()
 
-	qrChan, err := w.client.GetQRChannel(w.ctx)
-	if err != nil {
-		w.mu.Lock()
-		w.qrActive = false
-		w.lastPairErr = err.Error()
-		w.mu.Unlock()
-		return fmt.Errorf("get qr channel: %w", err)
-	}
-	if err := w.client.Connect(); err != nil {
-		w.mu.Lock()
-		w.qrActive = false
-		w.lastPairErr = err.Error()
-		w.mu.Unlock()
-		return fmt.Errorf("connect: %w", err)
-	}
-
-	go func() {
-		for evt := range qrChan {
-			switch evt.Event {
-			case "code":
-				w.mu.Lock()
-				w.currentQR = evt.Code
-				w.mu.Unlock()
-			case "success":
-				w.mu.Lock()
-				w.currentQR = ""
-				w.qrActive = false
-				w.mu.Unlock()
-				return
-			case "timeout":
-				w.mu.Lock()
-				w.lastPairErr = "pairing timed out — refresh QR to try again"
-				w.qrActive = false
-				w.mu.Unlock()
-				return
-			case "err-client-outdated":
-				w.mu.Lock()
-				w.lastPairErr = "whatsmeow client is outdated — rebuild the sidecar"
-				w.qrActive = false
-				w.mu.Unlock()
-				return
-			default:
-				if evt.Error != nil {
+	// Try at most twice: if the first Connect reports a deleted device we
+	// purge it and retry exactly once on a guaranteed-clean device. The
+	// bound (attempt == 0 guard) means a stubborn store can never spin
+	// forever in production — a second failure surfaces as a clean error.
+	for attempt := 0; ; attempt++ {
+		qrChan, err := w.client.GetQRChannel(w.ctx)
+		if err != nil {
+			w.mu.Lock()
+			w.qrActive = false
+			w.lastPairErr = err.Error()
+			w.mu.Unlock()
+			return fmt.Errorf("get qr channel: %w", err)
+		}
+		if cerr := w.client.Connect(); cerr != nil {
+			// A poisoned (deleted) device slipped through — purge it and
+			// retry once on a clean device instead of leaving the user
+			// staring at "connect: invalid use of deleted device".
+			if isDeletedDeviceErr(cerr) && attempt == 0 {
+				if rerr := w.resetSession(); rerr != nil {
 					w.mu.Lock()
-					w.lastPairErr = evt.Error.Error()
+					w.qrActive = false
+					w.lastPairErr = "session reset failed: " + rerr.Error()
+					w.mu.Unlock()
+					return fmt.Errorf("reset after deleted device: %w", rerr)
+				}
+				// resetSession cleared qrActive; re-arm for the retry.
+				w.mu.Lock()
+				w.qrActive = true
+				w.lastPairErr = ""
+				w.mu.Unlock()
+				continue
+			}
+			w.mu.Lock()
+			w.qrActive = false
+			w.lastPairErr = cerr.Error()
+			w.mu.Unlock()
+			return fmt.Errorf("connect: %w", cerr)
+		}
+
+		go func() {
+			for evt := range qrChan {
+				switch evt.Event {
+				case "code":
+					w.mu.Lock()
+					w.currentQR = evt.Code
+					w.mu.Unlock()
+				case "success":
+					w.mu.Lock()
+					w.currentQR = ""
 					w.qrActive = false
 					w.mu.Unlock()
 					return
+				case "timeout":
+					w.mu.Lock()
+					w.lastPairErr = "pairing timed out — refresh QR to try again"
+					w.qrActive = false
+					w.mu.Unlock()
+					return
+				case "err-client-outdated":
+					w.mu.Lock()
+					w.lastPairErr = "whatsmeow client is outdated — rebuild the sidecar"
+					w.qrActive = false
+					w.mu.Unlock()
+					return
+				default:
+					if evt.Error != nil {
+						w.mu.Lock()
+						w.lastPairErr = evt.Error.Error()
+						w.qrActive = false
+						w.mu.Unlock()
+						return
+					}
 				}
 			}
-		}
-	}()
-	return nil
+		}()
+		return nil
+	}
 }
 
 // BeginPhonePairing asks WhatsApp for a phone-number pairing code. The
@@ -378,7 +402,18 @@ func (w *waClient) BeginPhonePairing(phone string) (string, error) {
 	// handshake over the existing socket). Connect anonymously first.
 	if !w.client.IsConnected() {
 		if err := w.client.Connect(); err != nil {
-			return "", fmt.Errorf("connect: %w", err)
+			// Same deleted-device self-heal as the QR path: purge the
+			// poisoned device and connect on a clean one.
+			if isDeletedDeviceErr(err) {
+				if rerr := w.resetSession(); rerr != nil {
+					return "", fmt.Errorf("reset after deleted device: %w", rerr)
+				}
+				if cerr := w.client.Connect(); cerr != nil {
+					return "", fmt.Errorf("connect: %w", cerr)
+				}
+			} else {
+				return "", fmt.Errorf("connect: %w", err)
+			}
 		}
 	}
 	code, err := w.client.PairPhone(w.ctx, clean, true,
@@ -431,14 +466,18 @@ func (w *waClient) Unlink() error {
 		w.client.Disconnect()
 	}
 	w.mu.Lock()
-	w.currentQR = ""
-	w.pairingCode = ""
-	w.qrActive = false
 	w.target = nil
 	w.targetPhone = ""
 	w.mu.Unlock()
 	_ = os.Remove(w.targetFile)
-	return nil
+	// Logout deletes the device, which leaves the in-memory client poisoned:
+	// every later GetQRChannel/Connect would fail with "invalid use of
+	// deleted device". Rebuild a clean, unregistered client so the next
+	// pairing starts fresh. This is the bug that kept the error recurring
+	// after an unlink — Connect()/LoggedOut already self-heal, but Unlink
+	// didn't rebuild the client. resetSession also clears the QR/pairing
+	// state, so we no longer do that by hand here.
+	return w.resetSession()
 }
 
 // handleEvent is the whatsmeow event sink. We only care about incoming
