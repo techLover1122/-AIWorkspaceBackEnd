@@ -30,6 +30,7 @@ import type { PermissionRequestPayload } from "../handlers/permission.js";
 import { isUserPresent, onPresenceChange } from "./presenceTracker.js";
 import { getWhatsAppForwardingEnabled } from "./userPrefs.js";
 import { publishEvent } from "../handlers/events.js";
+import { abortTask, listActiveTasks } from "./taskRegistry.js";
 
 const SIDECAR_URL = process.env.WHATSAPP_SIDECAR_URL ?? "http://127.0.0.1:8091";
 const AUTH_TOKEN = process.env.WHATSAPP_AUTH_TOKEN ?? "";
@@ -469,11 +470,22 @@ export type IncomingResult =
   | { kind: "permission_deny"; permissionId: string }
   | { kind: "ask_answer"; toolUseId: string; followUpPreview: string }
   | { kind: "new_chat"; taskId: string }
+  | { kind: "stopped"; count: number }
   | { kind: "ignored"; reason: string };
 
 export async function handleIncomingMessage(text: string): Promise<IncomingResult> {
   const trimmed = text.trim();
   if (!trimmed) return { kind: "ignored", reason: "empty text" };
+
+  // 0. Global stop command — highest priority. "Stop" must actually
+  //    abort the running task(s), NOT fall through and start a brand-new
+  //    chat turn whose message is the literal word "Stop" (the old bug:
+  //    the agent just replied "Stopped." while the real task kept
+  //    running). Wins over any pending permission/ask too — when a user
+  //    says stop, they mean stop everything, not "deny this one tool".
+  if (isStopCommand(trimmed)) {
+    return await handleStopCommand();
+  }
 
   // 1. Pending permission? Parse yes/no/y/n/1/2.
   if (pendingPermission) {
@@ -545,8 +557,47 @@ export async function handleIncomingMessage(text: string): Promise<IncomingResul
 function parseYesNo(text: string): "allow" | "deny" | null {
   const t = text.toLowerCase().trim().replace(/[.!?]+$/, "");
   if (["yes", "y", "yeah", "yep", "allow", "ok", "1"].includes(t)) return "allow";
-  if (["no", "n", "nope", "deny", "stop", "2"].includes(t)) return "deny";
+  // Note: "stop" is intentionally NOT here — it's a global abort command
+  // handled before this (isStopCommand), so it stops the whole task
+  // rather than just denying one pending permission.
+  if (["no", "n", "nope", "deny", "2"].includes(t)) return "deny";
   return null;
+}
+
+/** A standalone "stop the agent" command. Kept deliberately narrow —
+ *  only short, unambiguous phrases match, so a normal chat prompt that
+ *  merely contains the word "stop" (e.g. "stop the server in prod") is
+ *  still treated as a real prompt, not an abort. */
+function isStopCommand(text: string): boolean {
+  const t = text.toLowerCase().trim().replace(/[.!?]+$/, "");
+  return ["stop", "cancel", "abort", "halt", "stop it", "cancel it"].includes(t);
+}
+
+/** Abort every running task, resolve any pending interaction so its
+ *  Promise doesn't dangle, and confirm back to the phone. */
+async function handleStopCommand(): Promise<IncomingResult> {
+  const running = listActiveTasks().filter((t) => t.status === "running");
+  let aborted = 0;
+  for (const t of running) {
+    if (abortTask(t.taskId)) aborted++;
+  }
+  // A pending permission holds an unresolved Promise the SDK is awaiting.
+  // Deny it so that path unwinds cleanly instead of hanging post-abort.
+  if (pendingPermission && isPending(pendingPermission.permissionId)) {
+    denyPending(pendingPermission.permissionId, "Stopped via WhatsApp");
+  }
+  pendingPermission = null;
+  pendingAsk = null;
+
+  if (aborted > 0) {
+    await sidecarSend(
+      `🛑 Stopped ${aborted === 1 ? "the running task" : `${aborted} running tasks`}.`
+    );
+  } else {
+    await sidecarSend("🛑 Nothing was running to stop.");
+  }
+  info("WhatsApp stop command:", { aborted });
+  return { kind: "stopped", count: aborted };
 }
 
 /** Returns { [questionIndex]: number[] } where the inner array is the
@@ -676,4 +727,5 @@ export const __testInternals = {
   },
   getPendingPermission: () => pendingPermission,
   getPendingAsk: () => pendingAsk,
+  isStopCommand,
 };
