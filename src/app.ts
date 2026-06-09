@@ -44,6 +44,7 @@ import {
   handleCallback,
   handleFileFetch,
   handleFileUpload,
+  handleEditorPage,
 } from "./handlers/office.js";
 import {
   handlePluginConfig,
@@ -113,10 +114,12 @@ export function createApp(config: AppConfig) {
   //   POST /api/office/callback         → ONLYOFFICE save loop
   //   GET  /api/office/file/:fileId     → ONLYOFFICE fetches docs here
   //   PUT  /api/office/file/:fileId     → seed/replace file bytes
+  //   GET  /api/office/editor           → HTML page that mounts the editor
   app.post("/api/office/config", handleEditorConfig);
   app.post("/api/office/callback", handleCallback);
   app.get("/api/office/file/:fileId", handleFileFetch);
   app.put("/api/office/file/:fileId", handleFileUpload);
+  app.get("/api/office/editor", handleEditorPage);
 
   // ai-agent-bridge ONLYOFFICE plugin — three static assets served from
   // this backend (rather than bind-mounted into the Docs containers).

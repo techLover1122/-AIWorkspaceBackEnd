@@ -488,19 +488,19 @@ fi
 # The ai-ide-services.service unit (provisioned by the wrapper user-
 # data, not here) runs /usr/local/bin/ai-ide-restart-services.sh on
 # every boot and replays every *.sh in ~/.ai-ide/services/ inside a
-# fresh tmux session. We use that hook to keep two stateful pieces
+# fresh tmux session. We use that hook to keep the docs/sheets bridge
 # running across reboots:
 #
-#   employee-todo.sh         — Next.js dev server on port 3456 that
-#                              serves the employees-<USER>.<DOMAIN>
-#                              subdomain (mounts the ONLYOFFICE editor).
 #   headless-coeditors.sh    — Two long-running Playwright headless
 #                              Chromiums inside the ai-ide-playwright
-#                              container. Each holds an editor session
-#                              open so the ai-agent-bridge plugin can
-#                              connect to docs-agent / sheets-agent
-#                              even when the user has no browser tab
-#                              open on the document.
+#                              container. Each opens the backend editor
+#                              page (/api/office/editor) so the
+#                              ai-agent-bridge plugin can connect to
+#                              docs-agent / sheets-agent even when the
+#                              user has no browser tab open on the
+#                              document. (The legacy employee-todo
+#                              Next.js app on port 3456 is gone — the
+#                              backend serves the editor page itself.)
 
 hdr "Step 8 — Docs/Sheets bridge boot recipes"
 
@@ -509,7 +509,12 @@ SERVICES_DIR="${TARGET_HOME}/.ai-ide/services"
 as_user mkdir -p "$SERVICES_DIR"
 
 if [ -d "${SCRIPTS_SRC}/recipes" ]; then
-  for recipe in employee-todo.sh headless-coeditors.sh; do
+  # NOTE: employee-todo.sh is intentionally NOT installed. The ONLYOFFICE
+  # editor page is now served by the backend at /api/office/editor
+  # (handlers/office.ts); the legacy employee-todo Next.js app on port
+  # 3456 never existed on the instance. headless-coeditors.sh opens the
+  # backend editor URL directly.
+  for recipe in headless-coeditors.sh; do
     src="${SCRIPTS_SRC}/recipes/${recipe}"
     dst="${SERVICES_DIR}/${recipe}"
     if [ -f "$src" ]; then
@@ -532,7 +537,7 @@ if systemctl list-unit-files | grep -q '^ai-ide-services\.service'; then
   systemctl restart ai-ide-services || log "WARN: ai-ide-services restart failed"
 else
   log "ai-ide-services.service not installed — starting recipes directly"
-  for recipe in employee-todo.sh headless-coeditors.sh; do
+  for recipe in headless-coeditors.sh; do
     f="${SERVICES_DIR}/${recipe}"
     [ -f "$f" ] || continue
     name="${recipe%.sh}"

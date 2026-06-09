@@ -27,6 +27,13 @@ import { buildEmptyOffice } from "./office-templates.js";
  *     The URL ONLYOFFICE itself fetches the document from. Authenticated
  *     by the Authorization JWT ONLYOFFICE attaches to outbound requests.
  *
+ *   GET /api/office/editor?fileId=&type=&name=
+ *     A self-contained HTML page that mounts the ONLYOFFICE editor. It
+ *     fetches its own /api/office/config (same-origin), loads the Docs
+ *     Server api.js, and calls `new DocsAPI.DocEditor(...)`. This is what
+ *     the headless co-editor Playwright sessions open, and what replaces
+ *     the legacy `employee-todo` Next.js app that used to host the iframe.
+ *
  * Plus a minimal upload route so seed files can land in workspace
  * storage before the first open:
  *
@@ -430,4 +437,79 @@ export async function handleFileUpload(c: Context) {
     version: fs.version,
     key: fs.key,
   });
+}
+
+/**
+ * GET /api/office/editor?fileId=<id>&type=<docx|xlsx>&name=<title>
+ *
+ * Returns a self-contained HTML page that mounts the ONLYOFFICE editor.
+ * The page POSTs to /api/office/config (same-origin) to obtain the signed
+ * config + the Docs Server api.js URL, loads that script, then calls
+ * `new DocsAPI.DocEditor("editor", config)`.
+ *
+ * This replaces the legacy `employee-todo` Next.js app (port 3456 /
+ * employees-<USER>.<DOMAIN>/edit) that never existed on the instance.
+ * The headless co-editor Playwright sessions (headless-coeditors.sh) open
+ * this URL so the ai-agent-bridge plugin can connect docs-agent /
+ * sheets-agent even with no user tab open. Since the editor still loads
+ * from docs-<USER> / sheets-<USER>, the plugin derives the correct agent
+ * WebSocket origin from the editor frame, not from this page.
+ *
+ * All params are read client-side from the query string, so there's no
+ * server-side interpolation of untrusted input into the HTML.
+ */
+export async function handleEditorPage(c: Context) {
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Office Editor</title>
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; }
+    #editor { position: absolute; inset: 0; }
+    #err { font: 14px/1.5 system-ui, sans-serif; padding: 16px; color: #b00; }
+  </style>
+</head>
+<body>
+  <div id="editor"></div>
+  <script>
+    (async function () {
+      try {
+        var qs = new URLSearchParams(location.search);
+        var fileId = qs.get("fileId") || "default-doc";
+        var fileType = qs.get("type") || "docx";
+        var fileName = qs.get("name") || (fileId + "." + fileType);
+
+        var res = await fetch("/api/office/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileId: fileId, fileType: fileType, fileName: fileName })
+        });
+        if (!res.ok) throw new Error("config request failed: " + res.status);
+        var data = await res.json();
+        if (!data || !data.config || !data.scriptUrl) {
+          throw new Error("config response missing config/scriptUrl");
+        }
+
+        await new Promise(function (resolve, reject) {
+          var s = document.createElement("script");
+          s.src = data.scriptUrl;
+          s.onload = resolve;
+          s.onerror = function () { reject(new Error("failed to load " + data.scriptUrl)); };
+          document.head.appendChild(s);
+        });
+
+        // eslint-disable-next-line no-new, no-undef
+        new DocsAPI.DocEditor("editor", data.config);
+      } catch (e) {
+        document.body.innerHTML =
+          '<pre id="err">Editor failed to load:\\n' +
+          String((e && e.message) || e) + "</pre>";
+      }
+    })();
+  </script>
+</body>
+</html>`;
+  return c.html(html);
 }

@@ -35,9 +35,14 @@ fi
 USER_ID="${USER_ID:?USER_ID must be set (sourced from /etc/workspace.env)}"
 PLATFORM_DOMAIN="${PLATFORM_DOMAIN:-platform.bytescripterz.com}"
 PLATFORM_PROTOCOL="${PLATFORM_PROTOCOL:-https}"
-EMPLOYEES_HOST="${PLATFORM_PROTOCOL}://employees-${USER_ID}.${PLATFORM_DOMAIN}"
-DOCS_URL="${DOCS_URL:-${EMPLOYEES_HOST}/edit?fileId=default-doc&type=docx&name=Document.docx}"
-SHEETS_URL="${SHEETS_URL:-${EMPLOYEES_HOST}/edit?fileId=employees&type=xlsx&name=Employees.xlsx}"
+# The editor page is now served by the backend itself at
+# /api/office/editor (handlers/office.ts) — no separate employee-todo
+# Next.js app. The page loads the ONLYOFFICE editor from docs-<USER> /
+# sheets-<USER>, so the ai-agent-bridge plugin still derives the correct
+# agent WebSocket origin from the editor frame.
+API_HOST="${API_HOST:-${PLATFORM_PROTOCOL}://api-${USER_ID}.${PLATFORM_DOMAIN}}"
+DOCS_URL="${DOCS_URL:-${API_HOST}/api/office/editor?fileId=default-doc&type=docx&name=Document.docx}"
+SHEETS_URL="${SHEETS_URL:-${API_HOST}/api/office/editor?fileId=employees&type=xlsx&name=Employees.xlsx}"
 
 # Wait for the playwright container to be running (it's a separate
 # docker / systemd unit and may come up after us).
@@ -49,14 +54,14 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-# Wait for the employee-todo dev server — the headless browser
-# navigates to its /edit page. The companion employee-todo.sh recipe
-# brings it up; without it the editor iframe never loads.
+# Wait for the backend — the headless browser navigates to its
+# /api/office/editor page, which fetches /api/office/config. We probe the
+# local backend port directly (faster + works before Traefik/DNS settles).
 for i in $(seq 1 60); do
-  if curl -fsS -o /dev/null "${EMPLOYEES_HOST}/" 2>/dev/null; then
+  if curl -fsS -o /dev/null "http://localhost:8090/api/status" 2>/dev/null; then
     break
   fi
-  echo "[headless-coeditors] waiting for ${EMPLOYEES_HOST}…"
+  echo "[headless-coeditors] waiting for backend on :8090…"
   sleep 5
 done
 
