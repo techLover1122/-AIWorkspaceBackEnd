@@ -517,28 +517,45 @@ func (w *waClient) handleEvent(evt interface{}) {
 }
 
 func (w *waClient) handleMessage(m *events.Message) {
-	// Inbound filter — depends on whether a custom recipient is set:
-	//   * Recipient configured → accept ONLY messages whose chat is
-	//     that recipient. Their replies are the agent's user input.
-	//   * No recipient → accept IsFromMe (messages typed in the
-	//     "Message Yourself" chat). The default self-chat flow.
-	// Either way, random unrelated contacts can never drive the agent.
+	// Inbound filter — ONLY the user's own account may drive the agent:
+	//   * Recipient configured → accept ONLY that recipient's INCOMING
+	//     replies in the 1:1 chat with them.
+	//   * No recipient (default) → accept ONLY the user's OWN self-chat
+	//     ("Message Yourself").
+	// Everything else is ignored: other contacts (incoming OR the user's
+	// own outbound to them), groups, broadcasts/status, and the device's
+	// own outbound echoes. The previous default-mode check accepted ANY
+	// IsFromMe message, so the user's conversations with other people
+	// leaked into the agent panel — that's the bug this closes.
+	self := w.client.Store.ID
+	if self == nil {
+		return // not paired — nothing legitimate can arrive
+	}
 	w.mu.RLock()
 	override := w.target
 	w.mu.RUnlock()
-	if override != nil {
-		if m.Info.Chat.User != override.User {
-			return
-		}
-		// Skip the linked device's own echo of its outbound message
-		// (whatsmeow surfaces those too). Without this guard, the
-		// agent's WhatsApp post would loop right back as an "incoming"
-		// turn.
-		if m.Info.IsFromMe {
-			return
-		}
-	} else if !m.Info.IsFromMe {
+
+	chat := m.Info.Chat
+	// Only ever consider plain 1:1 user chats. Groups (g.us), broadcasts,
+	// status (status@broadcast) and newsletters have a different server and
+	// must never reach the agent.
+	if chat.Server != types.DefaultUserServer {
 		return
+	}
+
+	if override != nil {
+		// Only the configured recipient's replies (their incoming messages,
+		// not our own outbound echo to them).
+		if chat.User != override.User || m.Info.IsFromMe {
+			return
+		}
+	} else {
+		// Default: ONLY the self-chat. Require the chat to be the user's own
+		// JID — not just IsFromMe, which also fires for messages the user
+		// sends to anyone else.
+		if chat.User != self.User || !m.Info.IsFromMe {
+			return
+		}
 	}
 	text := extractText(m.Message)
 	if text == "" {
