@@ -30,6 +30,14 @@ func newRouter(wa *waClient, authToken string) http.Handler {
 		// goroutine writes the latest QR code into wa.currentQR.
 		if !wa.IsRegistered() {
 			if err := wa.BeginQRPairing(); err != nil {
+				// A poisoned/deleted-device session must never reach the
+				// user. BeginQRPairing already wiped the store as part of
+				// its recovery, so just keep the modal polling ("Generating
+				// code…") — the next tick begins pairing on the clean device.
+				if isDeletedDeviceErr(err) {
+					writeJSON(w, http.StatusOK, map[string]any{"qr": "", "qrPngUrl": "", "paired": false})
+					return
+				}
 				writeErr(w, http.StatusConflict, err)
 				return
 			}

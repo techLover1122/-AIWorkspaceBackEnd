@@ -29,6 +29,7 @@ type waClient struct {
 	container *sqlstore.Container
 	client    *whatsmeow.Client
 	webhook   *webhookPoster
+	dbPath     string // path to session.db — needed for an on-disk store wipe
 	targetFile string // path to target.json — persists the recipient phone
 
 	mu          sync.RWMutex
@@ -41,11 +42,9 @@ type waClient struct {
 }
 
 func newClient(ctx context.Context, dbPath, backendURL, authToken string) (*waClient, error) {
-	dbLog := waLog.Stdout("Database", "WARN", true)
-	dsn := "file:" + dbPath + "?_foreign_keys=on&_journal_mode=WAL"
-	container, err := sqlstore.New(ctx, "sqlite3", dsn, dbLog)
+	container, err := openContainer(ctx, dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("open device store: %w", err)
+		return nil, err
 	}
 
 	device, err := container.GetFirstDevice(ctx)
@@ -61,11 +60,25 @@ func newClient(ctx context.Context, dbPath, backendURL, authToken string) (*waCl
 		container:  container,
 		client:     cli,
 		webhook:    newWebhookPoster(backendURL, authToken),
+		dbPath:     dbPath,
 		targetFile: filepath.Join(filepath.Dir(dbPath), "target.json"),
 	}
 	wa.loadTargetFromDisk()
 	cli.AddEventHandler(wa.handleEvent)
 	return wa, nil
+}
+
+// openContainer opens (creating if absent) the whatsmeow sqlite device
+// store at dbPath. Shared by initial startup and the on-disk store wipe
+// (hardResetStore) so both paths use identical DSN/journal settings.
+func openContainer(ctx context.Context, dbPath string) (*sqlstore.Container, error) {
+	dbLog := waLog.Stdout("Database", "WARN", true)
+	dsn := "file:" + dbPath + "?_foreign_keys=on&_journal_mode=WAL"
+	container, err := sqlstore.New(ctx, "sqlite3", dsn, dbLog)
+	if err != nil {
+		return nil, fmt.Errorf("open device store: %w", err)
+	}
+	return container, nil
 }
 
 // loadTargetFromDisk repopulates the in-memory target from
@@ -188,6 +201,58 @@ func (w *waClient) resetSession() error {
 	return nil
 }
 
+// hardResetStore is the nuclear fallback for a poisoned session store
+// that the in-process resetSession can't clear: it closes the sqlite
+// container, deletes session.db (plus its WAL/SHM sidecars) from disk,
+// and rebuilds a brand-new empty store with a fresh unregistered client.
+// This is exactly what a manual `rm session.db` + restart does, but
+// without operator intervention — so "invalid use of deleted device" can
+// never wedge pairing permanently. The recipient override lives in a
+// separate target.json and is intentionally left untouched.
+func (w *waClient) hardResetStore() error {
+	if w.client != nil && w.client.IsConnected() {
+		w.client.Disconnect()
+	}
+	if w.container != nil {
+		// Best-effort close so the OS releases the file handles before we
+		// unlink. If Close fails we still unlink — on Linux removing an
+		// open sqlite file is safe and the orphaned handle is GC'd.
+		_ = w.container.Close()
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(w.dbPath + suffix)
+	}
+	container, err := openContainer(w.ctx, w.dbPath)
+	if err != nil {
+		return fmt.Errorf("reopen store after wipe: %w", err)
+	}
+	device := container.NewDevice()
+	clientLog := waLog.Stdout("Client", "WARN", true)
+	newCli := whatsmeow.NewClient(device, clientLog)
+	newCli.AddEventHandler(w.handleEvent)
+
+	w.mu.Lock()
+	w.container = container
+	w.client = newCli
+	w.currentQR = ""
+	w.pairingCode = ""
+	w.qrActive = false
+	w.lastPairErr = ""
+	w.mu.Unlock()
+	return nil
+}
+
+// recoverDeletedDevice escalates the cleanup for a deleted-device error
+// by attempt: the first failure gets the cheap in-process purge; any
+// later failure wipes the store from disk. Bounded by BeginQRPairing's
+// retry cap so it can never spin forever.
+func (w *waClient) recoverDeletedDevice(attempt int) error {
+	if attempt == 0 {
+		return w.resetSession()
+	}
+	return w.hardResetStore()
+}
+
 // recoverFromLogout runs the deleted-device recovery off the whatsmeow
 // event loop (calling Disconnect/Connect inline from a handler can
 // deadlock), then immediately offers a fresh QR.
@@ -308,82 +373,92 @@ func (w *waClient) BeginQRPairing() error {
 	w.lastPairErr = ""
 	w.mu.Unlock()
 
-	// Try at most twice: if the first Connect reports a deleted device we
-	// purge it and retry exactly once on a guaranteed-clean device. The
-	// bound (attempt == 0 guard) means a stubborn store can never spin
-	// forever in production — a second failure surfaces as a clean error.
-	for attempt := 0; ; attempt++ {
+	// Escalating self-heal for the recurring "invalid use of deleted
+	// device". On each deleted-device failure we clean up harder and retry
+	// on a guaranteed-fresh device:
+	//   attempt 0 → the device on disk as-is
+	//   attempt 1 → after an in-process purge (resetSession)
+	//   attempt 2 → after wiping the sqlite store from disk (hardResetStore)
+	// A real first-ever pairing always succeeds by attempt 2, so if we
+	// somehow still see a deleted-device error we SWALLOW it (return nil on
+	// a now-clean, unregistered client) rather than surface the scary
+	// string — the next /qr poll simply begins pairing on the fresh device.
+	// Non-deleted-device errors (network, outdated client) still surface.
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		qrChan, err := w.client.GetQRChannel(w.ctx)
-		if err != nil {
+		if err == nil {
+			err = w.client.Connect()
+		}
+		if err == nil {
+			go w.consumeQRChannel(qrChan)
+			return nil
+		}
+		if !isDeletedDeviceErr(err) {
 			w.mu.Lock()
 			w.qrActive = false
 			w.lastPairErr = err.Error()
 			w.mu.Unlock()
-			return fmt.Errorf("get qr channel: %w", err)
+			return fmt.Errorf("begin pairing: %w", err)
 		}
-		if cerr := w.client.Connect(); cerr != nil {
-			// A poisoned (deleted) device slipped through — purge it and
-			// retry once on a clean device instead of leaving the user
-			// staring at "connect: invalid use of deleted device".
-			if isDeletedDeviceErr(cerr) && attempt == 0 {
-				if rerr := w.resetSession(); rerr != nil {
-					w.mu.Lock()
-					w.qrActive = false
-					w.lastPairErr = "session reset failed: " + rerr.Error()
-					w.mu.Unlock()
-					return fmt.Errorf("reset after deleted device: %w", rerr)
-				}
-				// resetSession cleared qrActive; re-arm for the retry.
-				w.mu.Lock()
-				w.qrActive = true
-				w.lastPairErr = ""
-				w.mu.Unlock()
-				continue
-			}
+		// Deleted device — escalate the cleanup, then retry.
+		if rerr := w.recoverDeletedDevice(attempt); rerr != nil {
 			w.mu.Lock()
 			w.qrActive = false
-			w.lastPairErr = cerr.Error()
+			w.lastPairErr = "deleted-device recovery failed: " + rerr.Error()
 			w.mu.Unlock()
-			return fmt.Errorf("connect: %w", cerr)
+			return fmt.Errorf("deleted-device recovery: %w", rerr)
 		}
+		w.mu.Lock()
+		w.qrActive = true
+		w.lastPairErr = ""
+		w.mu.Unlock()
+	}
+	// Retries exhausted on a deleted-device loop. The store was wiped on
+	// the last pass, so the client is clean and unregistered — report a
+	// no-op success and let the next poll start a fresh pairing.
+	w.mu.Lock()
+	w.qrActive = false
+	w.mu.Unlock()
+	return nil
+}
 
-		go func() {
-			for evt := range qrChan {
-				switch evt.Event {
-				case "code":
-					w.mu.Lock()
-					w.currentQR = evt.Code
-					w.mu.Unlock()
-				case "success":
-					w.mu.Lock()
-					w.currentQR = ""
-					w.qrActive = false
-					w.mu.Unlock()
-					return
-				case "timeout":
-					w.mu.Lock()
-					w.lastPairErr = "pairing timed out — refresh QR to try again"
-					w.qrActive = false
-					w.mu.Unlock()
-					return
-				case "err-client-outdated":
-					w.mu.Lock()
-					w.lastPairErr = "whatsmeow client is outdated — rebuild the sidecar"
-					w.qrActive = false
-					w.mu.Unlock()
-					return
-				default:
-					if evt.Error != nil {
-						w.mu.Lock()
-						w.lastPairErr = evt.Error.Error()
-						w.qrActive = false
-						w.mu.Unlock()
-						return
-					}
-				}
+// consumeQRChannel drains the pairing QR channel, publishing each emitted
+// code into currentQR (polled by /qr) and recording terminal outcomes.
+func (w *waClient) consumeQRChannel(qrChan <-chan whatsmeow.QRChannelItem) {
+	for evt := range qrChan {
+		switch evt.Event {
+		case "code":
+			w.mu.Lock()
+			w.currentQR = evt.Code
+			w.mu.Unlock()
+		case "success":
+			w.mu.Lock()
+			w.currentQR = ""
+			w.qrActive = false
+			w.mu.Unlock()
+			return
+		case "timeout":
+			w.mu.Lock()
+			w.lastPairErr = "pairing timed out — refresh QR to try again"
+			w.qrActive = false
+			w.mu.Unlock()
+			return
+		case "err-client-outdated":
+			w.mu.Lock()
+			w.lastPairErr = "whatsmeow client is outdated — rebuild the sidecar"
+			w.qrActive = false
+			w.mu.Unlock()
+			return
+		default:
+			if evt.Error != nil {
+				w.mu.Lock()
+				w.lastPairErr = evt.Error.Error()
+				w.qrActive = false
+				w.mu.Unlock()
+				return
 			}
-		}()
-		return nil
+		}
 	}
 }
 
@@ -403,17 +478,23 @@ func (w *waClient) BeginPhonePairing(phone string) (string, error) {
 	// handshake over the existing socket). Connect anonymously first.
 	if !w.client.IsConnected() {
 		if err := w.client.Connect(); err != nil {
-			// Same deleted-device self-heal as the QR path: purge the
-			// poisoned device and connect on a clean one.
-			if isDeletedDeviceErr(err) {
-				if rerr := w.resetSession(); rerr != nil {
-					return "", fmt.Errorf("reset after deleted device: %w", rerr)
+			// Same escalating deleted-device self-heal as the QR path:
+			// in-process purge first, then an on-disk store wipe if the
+			// poison survives — so phone pairing can't get wedged either.
+			if !isDeletedDeviceErr(err) {
+				return "", fmt.Errorf("connect: %w", err)
+			}
+			for attempt := 0; ; attempt++ {
+				if rerr := w.recoverDeletedDevice(attempt); rerr != nil {
+					return "", fmt.Errorf("deleted-device recovery: %w", rerr)
 				}
-				if cerr := w.client.Connect(); cerr != nil {
+				cerr := w.client.Connect()
+				if cerr == nil {
+					break
+				}
+				if !isDeletedDeviceErr(cerr) || attempt >= 1 {
 					return "", fmt.Errorf("connect: %w", cerr)
 				}
-			} else {
-				return "", fmt.Errorf("connect: %w", err)
 			}
 		}
 	}
