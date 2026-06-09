@@ -30,7 +30,7 @@ import type { PermissionRequestPayload } from "../handlers/permission.js";
 import { isUserPresent, onPresenceChange } from "./presenceTracker.js";
 import { getWhatsAppForwardingEnabled } from "./userPrefs.js";
 import { publishEvent } from "../handlers/events.js";
-import { abortTask, listActiveTasks } from "./taskRegistry.js";
+import { abortTask, getTask, listActiveTasks } from "./taskRegistry.js";
 
 const SIDECAR_URL = process.env.WHATSAPP_SIDECAR_URL ?? "http://127.0.0.1:8091";
 const AUTH_TOKEN = process.env.WHATSAPP_AUTH_TOKEN ?? "";
@@ -543,15 +543,73 @@ export async function handleIncomingMessage(text: string): Promise<IncomingResul
     return { kind: "ignored", reason: "unparseable ask reply" };
   }
 
-  // 3. No pending interaction — treat as a fresh user prompt.
-  const session = getLastSession();
-  const res = await startChatTurn({
-    message: trimmed,
-    sessionId: session.sessionId,
-    workingDirectory: session.workingDirectory,
-    permissionMode: session.permissionMode,
-  });
-  return { kind: "new_chat", taskId: res.taskId };
+  // 3. No pending interaction — treat as a fresh user prompt. Serialize it
+  //    through the turn queue: rapid self-chat messages must NOT each spawn a
+  //    concurrent SDK turn resuming the same session (concurrent resumes
+  //    collide and replies get dropped — the "sent 4 messages, got 1 reply /
+  //    last message ignored" bug). The queue runs one turn at a time, each
+  //    resuming whatever session is current AFTER the previous turn finished.
+  return enqueueWhatsAppTurn(trimmed);
+}
+
+/* ──────────────────────────────────────────────────────────────────
+   WhatsApp turn serialization
+
+   handleChatRequest only dedups by identical requestId, so two WhatsApp
+   messages (each with a fresh wa_ id) would both start runChatTask against
+   the same sessionId concurrently. Concurrent `resume` of one session
+   corrupts the conversation and loses replies. We therefore queue fresh
+   prompts here and dispatch them strictly sequentially.
+   ────────────────────────────────────────────────────────────────── */
+
+const waTurnQueue: string[] = [];
+let waDraining = false;
+const WA_TURN_TIMEOUT_MS = 15 * 60 * 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function enqueueWhatsAppTurn(message: string): IncomingResult {
+  waTurnQueue.push(message);
+  info("WhatsApp turn queued:", { depth: waTurnQueue.length, draining: waDraining });
+  if (!waDraining) void drainWhatsAppQueue();
+  return { kind: "new_chat", taskId: "queued" };
+}
+
+async function drainWhatsAppQueue(): Promise<void> {
+  if (waDraining) return;
+  waDraining = true;
+  try {
+    while (waTurnQueue.length > 0) {
+      const message = waTurnQueue.shift() as string;
+      // Resolve the session fresh for EACH turn so we resume the conversation
+      // the previous turn just advanced, not a stale pre-turn id.
+      const session = getLastSession();
+      const { taskId } = await startChatTurn({
+        message,
+        sessionId: session.sessionId,
+        workingDirectory: session.workingDirectory,
+        permissionMode: session.permissionMode,
+      });
+      await waitForTaskDone(taskId);
+    }
+  } finally {
+    waDraining = false;
+  }
+}
+
+/** Block until the task leaves "running" (done / error / aborted / gone), or
+ *  the safety timeout fires so a stuck turn can't wedge the queue forever. */
+async function waitForTaskDone(taskId: string): Promise<void> {
+  const start = Date.now();
+  await sleep(300); // let the task register first
+  while (Date.now() - start < WA_TURN_TIMEOUT_MS) {
+    const t = getTask(taskId);
+    if (!t || t.status !== "running") return;
+    await sleep(700);
+  }
+  warn("WhatsApp turn wait timed out; moving to next queued message", { taskId });
 }
 
 function parseYesNo(text: string): "allow" | "deny" | null {
