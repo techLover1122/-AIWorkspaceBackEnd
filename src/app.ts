@@ -33,11 +33,7 @@ import {
 } from "./handlers/urls.js";
 import { handleEvents } from "./handlers/events.js";
 import { handleInstallPack } from "./handlers/packs.js";
-import {
-  handleProjectUpload,
-  handleProjectRun,
-  handleProjectRunStream,
-} from "./handlers/projectUpload.js";
+import { handleFileUpload as handleAssetUpload } from "./handlers/projectUpload.js";
 import { handlePermissionDecision } from "./handlers/permission.js";
 import { handleIntentGuardDecision } from "./handlers/intentGuard.js";
 import {
@@ -91,13 +87,9 @@ export function createApp(config: AppConfig) {
   app.get("/api/projects/:encodedProjectName/histories", handleHistoriesRequest);
   app.get("/api/projects/:encodedProjectName/histories/:sessionId", handleConversationRequest);
 
-  // Local project upload + auto-run. The frontend posts a zip (dropped .zip
-  // or a folder zipped client-side); we extract to ~/.ai-ide/projects/<name>/,
-  // then /run detects the project type, installs, starts the dev server, and
-  // streams output — auto-opening a preview tab when a localhost port appears.
-  app.post("/api/projects/upload", handleProjectUpload);
-  app.post("/api/projects/run", handleProjectRun);
-  app.get("/api/projects/run/:runId/stream", handleProjectRunStream);
+  // File/folder upload — saves files to the current working directory with
+  // their relative paths intact (folder structure preserved).
+  app.post("/api/files/upload", handleAssetUpload);
 
   app.get("/api/status", handleStatusRequest);
   app.post("/api/auth/api-key", handleSetApiKey);
