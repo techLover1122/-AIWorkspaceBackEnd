@@ -24,6 +24,7 @@ import { publishEvent } from "./events.js";
 
 const IS_WINDOWS = platform() === "win32";
 const PROJECTS_DIR = join(homedir(), ".ai-ide", "projects");
+const HOME_DIR = homedir();
 const MAX_UPLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
 
 /* ───────────────────────── upload ───────────────────────── */
@@ -56,14 +57,14 @@ async function flattenWrapper(stagingDir: string): Promise<string> {
   return stagingDir;
 }
 
-/** Pick a non-colliding target dir under PROJECTS_DIR (foo, foo-2, foo-3…). */
-async function uniqueProjectDir(name: string): Promise<string> {
-  let candidate = join(PROJECTS_DIR, name);
+/** Pick a non-colliding target dir under baseDir (foo, foo-2, foo-3…). */
+async function uniqueProjectDir(baseDir: string, name: string): Promise<string> {
+  let candidate = join(baseDir, name);
   let n = 2;
   for (;;) {
     try {
       await access(candidate);
-      candidate = join(PROJECTS_DIR, `${name}-${n}`);
+      candidate = join(baseDir, `${name}-${n}`);
       n += 1;
     } catch {
       return candidate;
@@ -79,6 +80,15 @@ async function uniqueProjectDir(name: string): Promise<string> {
 export async function handleProjectUpload(c: Context): Promise<Response> {
   const rawName = c.req.query("name") ?? c.req.header("x-project-name") ?? "project";
   const name = safeName(rawName);
+
+  // workingDirectory is the currently open folder in the IDE; we extract the
+  // project into a new subfolder there so the user's root doesn't change.
+  // Falls back to the managed ~/.ai-ide/projects/ dir if not provided.
+  const rawWd = c.req.query("workingDirectory");
+  const targetBaseDir =
+    rawWd && rawWd.trim()
+      ? rawWd.trim()
+      : PROJECTS_DIR;
 
   let buf: Buffer;
   try {
@@ -123,8 +133,8 @@ export async function handleProjectUpload(c: Context): Promise<Response> {
 
     const root = await flattenWrapper(stagingDir);
 
-    await mkdir(PROJECTS_DIR, { recursive: true });
-    const projectPath = await uniqueProjectDir(name);
+    await mkdir(targetBaseDir, { recursive: true });
+    const projectPath = await uniqueProjectDir(targetBaseDir, name);
     // rename is atomic on same fs; staging lives under tmpdir which may be a
     // different volume, so fall back to a recursive copy on EXDEV.
     try {
@@ -137,6 +147,11 @@ export async function handleProjectUpload(c: Context): Promise<Response> {
         throw err;
       }
     }
+
+    // Clean up the original zip if it lives in the same directory (e.g. the
+    // user had myapp.zip in their workspace before uploading it).
+    const zipArtifact = join(targetBaseDir, `${name}.zip`);
+    await rm(zipArtifact, { force: true }).catch(() => {});
 
     info(`[project-upload] extracted "${name}" → ${projectPath}`);
     return c.json({ ok: true, projectPath, name: basename(projectPath) });
@@ -351,11 +366,11 @@ export async function handleProjectRun(c: Context): Promise<Response> {
     return c.json({ ok: false, code: "bad_request", error: "Missing projectPath" }, 400);
   }
 
-  // Only allow running projects under our managed dir — prevents being used as
-  // a generic "run any path on the box" primitive via this endpoint.
-  if (!projectPath.startsWith(PROJECTS_DIR)) {
+  // Only allow running projects inside the user's home directory — prevents
+  // this endpoint from being used as a "run any path on the box" primitive.
+  if (!projectPath.startsWith(HOME_DIR)) {
     return c.json(
-      { ok: false, code: "forbidden", error: "projectPath must be an uploaded project" },
+      { ok: false, code: "forbidden", error: "projectPath must be within the home directory" },
       403
     );
   }
