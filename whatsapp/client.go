@@ -598,6 +598,19 @@ func (w *waClient) handleEvent(evt interface{}) {
 }
 
 func (w *waClient) handleMessage(m *events.Message) {
+	// TEMP DIAGNOSTIC — log every inbound message's addressing so we can see
+	// exactly which filter rejects the user's self-chat prompts. Remove once
+	// the inbound-drop bug is fixed.
+	{
+		var selfUser string
+		if id := w.client.Store.ID; id != nil {
+			selfUser = id.User
+		}
+		fmt.Printf("whatsapp DBG incoming: chat=%q chatServer=%q chatUser=%q sender=%q senderServer=%q isFromMe=%v isGroup=%v selfUser=%q msgType=%T\n",
+			m.Info.Chat.String(), m.Info.Chat.Server, m.Info.Chat.User,
+			m.Info.Sender.String(), m.Info.Sender.Server, m.Info.IsFromMe,
+			m.Info.IsGroup, selfUser, m.Message)
+	}
 	// Inbound filter — ONLY the user's own account may drive the agent:
 	//   * Recipient configured → accept ONLY that recipient's INCOMING
 	//     replies in the 1:1 chat with them.
