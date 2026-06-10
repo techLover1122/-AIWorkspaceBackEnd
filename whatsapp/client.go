@@ -624,16 +624,22 @@ func (w *waClient) handleMessage(m *events.Message) {
 		return
 	}
 
-	if override != nil {
-		// Only the configured recipient's replies (their incoming messages,
-		// not our own outbound echo to them).
+	if override != nil && override.User != self.User {
+		// Recipient is a DIFFERENT contact — accept only THEIR incoming
+		// replies (their messages, not our own outbound echo to them).
 		if chat.User != override.User || m.Info.IsFromMe {
 			return
 		}
 	} else {
-		// Default: ONLY the self-chat. Require the chat to be the user's own
-		// JID — not just IsFromMe, which also fires for messages the user
-		// sends to anyone else.
+		// Default self-chat, OR an override that points at the user's OWN
+		// number. WhatsApp routes a message addressed to your own number into
+		// the "Message Yourself" thread, where every message is IsFromMe — so
+		// the override-to-self case must use the self-chat rule, not the
+		// different-contact rule above. Otherwise the user's own prompts are
+		// always rejected (IsFromMe=true) and inbound silently dies while
+		// outbound still works — the bug this closes. Require the chat to be
+		// the user's own JID, not just IsFromMe (which also fires for messages
+		// the user sends to anyone else).
 		if chat.User != self.User || !m.Info.IsFromMe {
 			return
 		}
