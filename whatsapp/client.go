@@ -598,19 +598,6 @@ func (w *waClient) handleEvent(evt interface{}) {
 }
 
 func (w *waClient) handleMessage(m *events.Message) {
-	// TEMP DIAGNOSTIC — log every inbound message's addressing so we can see
-	// exactly which filter rejects the user's self-chat prompts. Remove once
-	// the inbound-drop bug is fixed.
-	{
-		var selfUser string
-		if id := w.client.Store.ID; id != nil {
-			selfUser = id.User
-		}
-		fmt.Printf("whatsapp DBG incoming: chat=%q chatServer=%q chatUser=%q sender=%q senderServer=%q isFromMe=%v isGroup=%v selfUser=%q msgType=%T\n",
-			m.Info.Chat.String(), m.Info.Chat.Server, m.Info.Chat.User,
-			m.Info.Sender.String(), m.Info.Sender.Server, m.Info.IsFromMe,
-			m.Info.IsGroup, selfUser, m.Message)
-	}
 	// Inbound filter — ONLY the user's own account may drive the agent:
 	//   * Recipient configured → accept ONLY that recipient's INCOMING
 	//     replies in the 1:1 chat with them.
@@ -630,10 +617,16 @@ func (w *waClient) handleMessage(m *events.Message) {
 	w.mu.RUnlock()
 
 	chat := m.Info.Chat
-	// Only ever consider plain 1:1 user chats. Groups (g.us), broadcasts,
-	// status (status@broadcast) and newsletters have a different server and
-	// must never reach the agent.
-	if chat.Server != types.DefaultUserServer {
+	// Only ever consider plain 1:1 user chats. WhatsApp now addresses chats
+	// via EITHER the classic phone-number server (s.whatsapp.net) OR the new
+	// privacy LID server (@lid) — the "Message Yourself" self-chat in
+	// particular arrives LID-addressed. Accept both; groups (g.us),
+	// broadcasts, status (status@broadcast) and newsletters live on other
+	// servers and must never reach the agent. (Rejecting @lid here was the
+	// bug that silently dropped every inbound self-chat prompt — chat.Server
+	// "lid" failed the old DefaultUserServer-only check before the webhook
+	// ever fired.)
+	if chat.Server != types.DefaultUserServer && chat.Server != types.HiddenUserServer {
 		return
 	}
 
@@ -644,16 +637,17 @@ func (w *waClient) handleMessage(m *events.Message) {
 			return
 		}
 	} else {
-		// Default self-chat, OR an override that points at the user's OWN
-		// number. WhatsApp routes a message addressed to your own number into
-		// the "Message Yourself" thread, where every message is IsFromMe — so
-		// the override-to-self case must use the self-chat rule, not the
-		// different-contact rule above. Otherwise the user's own prompts are
-		// always rejected (IsFromMe=true) and inbound silently dies while
-		// outbound still works — the bug this closes. Require the chat to be
-		// the user's own JID, not just IsFromMe (which also fires for messages
-		// the user sends to anyone else).
-		if chat.User != self.User || !m.Info.IsFromMe {
+		// Default self-chat ("Message Yourself"), OR an override pointing at
+		// the user's OWN number. The only legitimate driver is the user's own
+		// self-chat message: it is IsFromMe AND the conversation is with
+		// themselves — i.e. the chat JID and the sender JID are the same
+		// account. Comparing chat.User == sender.User identifies the self-chat
+		// robustly under BOTH phone-number and @lid addressing, WITHOUT
+		// needing to resolve our own LID (which differs from self.User). It
+		// also does NOT match messages the user sends to other people — there
+		// the chat is the other party and the sender is us, so the users
+		// differ — which is the leak the old check guarded against.
+		if !m.Info.IsFromMe || chat.User != m.Info.Sender.User {
 			return
 		}
 	}
