@@ -34,6 +34,11 @@ import {
 import { handleEvents } from "./handlers/events.js";
 import { handleInstallPack } from "./handlers/packs.js";
 import { handleFileUpload as handleAssetUpload } from "./handlers/projectUpload.js";
+import {
+  handleAvatarGet,
+  handleAvatarUpload,
+  handleAvatarDelete,
+} from "./handlers/profile.js";
 import { handlePermissionDecision } from "./handlers/permission.js";
 import { handleIntentGuardDecision } from "./handlers/intentGuard.js";
 import {
@@ -92,6 +97,11 @@ export function createApp(config: AppConfig) {
   // File/folder upload — saves files to the current working directory with
   // their relative paths intact (folder structure preserved).
   app.post("/api/files/upload", handleAssetUpload);
+
+  // Profile avatar — custom image stored on the instance (or bot default).
+  app.get("/api/profile/avatar", handleAvatarGet);
+  app.post("/api/profile/avatar", handleAvatarUpload);
+  app.delete("/api/profile/avatar", handleAvatarDelete);
 
   app.get("/api/status", handleStatusRequest);
   app.post("/api/auth/api-key", handleSetApiKey);
