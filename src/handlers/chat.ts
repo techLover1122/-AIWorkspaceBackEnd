@@ -1379,6 +1379,12 @@ function buildCodeOrganizationContext(): string {
 // frontend that intercepts the tool_use block, shows a popup, and sends the
 // user's answer back as a follow-up chat message — so it stays allowed.
 const DISALLOWED_TOOLS: string[] = [
+  // The desktop MCP server exposes browser_navigate (alwaysLoad), and merely
+  // dropping it from the allow-list didn't stop the model — it still called it
+  // and replaced the user's whole workspace tab with the requested site. A hard
+  // deny blocks the call outright, forcing the model to mcp__aiide__open_tab
+  // (a new tab) to open sites. browser_navigate_back stays allowed for "go back".
+  "mcp__desktopbrowser__browser_navigate",
 ];
 
 /**
