@@ -69,6 +69,7 @@ export interface ConversationSummary {
   lastTime: string;
   messageCount: number;
   lastMessagePreview: string;
+  title?: string;
 }
 
 export interface HistoryLine {

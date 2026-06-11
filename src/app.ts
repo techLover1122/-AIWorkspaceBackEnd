@@ -6,7 +6,7 @@ import {
   handleActiveTasksRequest,
 } from "./handlers/chatStream.js";
 import { handleProjectsRequest } from "./handlers/projects.js";
-import { handleHistoriesRequest } from "./handlers/histories.js";
+import { handleHistoriesRequest, handleDeleteConversation, handleRenameConversation } from "./handlers/histories.js";
 import { handleConversationRequest } from "./handlers/conversations.js";
 import { handleStatusRequest } from "./handlers/status.js";
 import { handleSetApiKey, handleClearAuth } from "./handlers/auth.js";
@@ -86,6 +86,8 @@ export function createApp(config: AppConfig) {
   app.get("/api/projects", handleProjectsRequest);
   app.get("/api/projects/:encodedProjectName/histories", handleHistoriesRequest);
   app.get("/api/projects/:encodedProjectName/histories/:sessionId", handleConversationRequest);
+  app.delete("/api/projects/:encodedProjectName/histories/:sessionId", handleDeleteConversation);
+  app.patch("/api/projects/:encodedProjectName/histories/:sessionId", handleRenameConversation);
 
   // File/folder upload — saves files to the current working directory with
   // their relative paths intact (folder structure preserved).

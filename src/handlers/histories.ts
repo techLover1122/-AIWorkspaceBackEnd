@@ -1,10 +1,24 @@
 import { Context } from "hono";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ConversationSummary, HistoryLine } from "../types.js";
 
 const CLAUDE_PROJECTS_DIR = join(homedir(), ".claude", "projects");
+const TITLES_FILE = "_titles.json";
+
+async function readTitles(historyDir: string): Promise<Record<string, string>> {
+  try {
+    const raw = await readFile(join(historyDir, TITLES_FILE), "utf-8");
+    return JSON.parse(raw) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeTitles(historyDir: string, titles: Record<string, string>): Promise<void> {
+  await writeFile(join(historyDir, TITLES_FILE), JSON.stringify(titles, null, 2), "utf-8");
+}
 
 /** Strip the `<ide_opened_file>…</ide_opened_file>` and similar IDE-injected
  *  tags so the preview shows the user's actual prompt instead of system noise. */
@@ -137,5 +151,52 @@ export async function handleHistoriesRequest(c: Context) {
     (a, b) => new Date(b.lastTime).getTime() - new Date(a.lastTime).getTime()
   );
 
+  const titles = await readTitles(historyDir);
+  for (const conv of conversations) {
+    if (titles[conv.sessionId]) conv.title = titles[conv.sessionId];
+  }
+
   return c.json({ conversations });
+}
+
+export async function handleDeleteConversation(c: Context) {
+  const encodedName = c.req.param("encodedProjectName");
+  const sessionId = c.req.param("sessionId");
+  if (!encodedName || !sessionId) return c.json({ error: "Missing parameters" }, 400);
+
+  const historyDir = join(CLAUDE_PROJECTS_DIR, encodedName);
+  const filePath = join(historyDir, `${sessionId}.jsonl`);
+  try {
+    await unlink(filePath);
+    const titles = await readTitles(historyDir);
+    if (sessionId in titles) {
+      delete titles[sessionId];
+      await writeTitles(historyDir, titles);
+    }
+    return c.json({ success: true });
+  } catch {
+    return c.json({ error: "Conversation not found" }, 404);
+  }
+}
+
+export async function handleRenameConversation(c: Context) {
+  const encodedName = c.req.param("encodedProjectName");
+  const sessionId = c.req.param("sessionId");
+  if (!encodedName || !sessionId) return c.json({ error: "Missing parameters" }, 400);
+
+  let body: { title?: string };
+  try {
+    body = await c.req.json() as { title?: string };
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+  if (typeof body.title !== "string" || !body.title.trim()) {
+    return c.json({ error: "title is required" }, 400);
+  }
+
+  const historyDir = join(CLAUDE_PROJECTS_DIR, encodedName);
+  const titles = await readTitles(historyDir);
+  titles[sessionId] = body.title.trim().slice(0, 200);
+  await writeTitles(historyDir, titles);
+  return c.json({ success: true });
 }
