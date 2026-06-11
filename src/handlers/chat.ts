@@ -92,36 +92,36 @@ const PLAYWRIGHT_MCP_URL =
       : _rawMcpUrl;
 const PLAYWRIGHT_TOOL_NAMES = PLAYWRIGHT_MCP_URL ? [
   // core — page interaction primitives
-  "mcp__playwright__browser_snapshot",
-  "mcp__playwright__browser_click",
-  "mcp__playwright__browser_drag",
-  "mcp__playwright__browser_hover",
-  "mcp__playwright__browser_select_option",
-  "mcp__playwright__browser_type",
-  "mcp__playwright__browser_press_key",
-  "mcp__playwright__browser_handle_dialog",
-  "mcp__playwright__browser_take_screenshot",
-  "mcp__playwright__browser_file_upload",
-  "mcp__playwright__browser_close",
-  "mcp__playwright__browser_resize",
-  "mcp__playwright__browser_wait_for",
-  "mcp__playwright__browser_evaluate",
-  "mcp__playwright__browser_navigate",
-  "mcp__playwright__browser_navigate_back",
-  "mcp__playwright__browser_console_messages",
-  "mcp__playwright__browser_network_requests",
+  "mcp__desktopbrowser__browser_snapshot",
+  "mcp__desktopbrowser__browser_click",
+  "mcp__desktopbrowser__browser_drag",
+  "mcp__desktopbrowser__browser_hover",
+  "mcp__desktopbrowser__browser_select_option",
+  "mcp__desktopbrowser__browser_type",
+  "mcp__desktopbrowser__browser_press_key",
+  "mcp__desktopbrowser__browser_handle_dialog",
+  "mcp__desktopbrowser__browser_take_screenshot",
+  "mcp__desktopbrowser__browser_file_upload",
+  "mcp__desktopbrowser__browser_close",
+  "mcp__desktopbrowser__browser_resize",
+  "mcp__desktopbrowser__browser_wait_for",
+  "mcp__desktopbrowser__browser_evaluate",
+  "mcp__desktopbrowser__browser_navigate",
+  "mcp__desktopbrowser__browser_navigate_back",
+  "mcp__desktopbrowser__browser_console_messages",
+  "mcp__desktopbrowser__browser_network_requests",
   // core-tabs
-  "mcp__playwright__browser_tabs",
+  "mcp__desktopbrowser__browser_tabs",
   // vision — coordinate-based interactions
-  "mcp__playwright__browser_mouse_click_xy",
-  "mcp__playwright__browser_mouse_drag_xy",
-  "mcp__playwright__browser_mouse_move_xy",
+  "mcp__desktopbrowser__browser_mouse_click_xy",
+  "mcp__desktopbrowser__browser_mouse_drag_xy",
+  "mcp__desktopbrowser__browser_mouse_move_xy",
   // pdf
-  "mcp__playwright__browser_pdf_save",
+  "mcp__desktopbrowser__browser_pdf_save",
   // network
-  "mcp__playwright__browser_network_capture",
+  "mcp__desktopbrowser__browser_network_capture",
   // devtools
-  "mcp__playwright__browser_devtools_console",
+  "mcp__desktopbrowser__browser_devtools_console",
 ] : [];
 
 /**
@@ -135,7 +135,7 @@ const PLAYWRIGHT_TOOL_NAMES = PLAYWRIGHT_MCP_URL ? [
 /**
  * The chat panel's most-load-bearing Phase 6 context.
  *
- * The `mcp__playwright__*` tools (browser_tabs / browser_snapshot /
+ * The `mcp__desktopbrowser__*` tools (browser_tabs / browser_snapshot /
  * browser_click / etc.) connect via a reverse SSH tunnel to a Playwright
  * MCP server running inside the user's desktop app. That MCP server
  * drives the user's actual WebContentsView tabs over CDP — the same tabs
@@ -152,13 +152,13 @@ const PLAYWRIGHT_TOOL_NAMES = PLAYWRIGHT_MCP_URL ? [
  */
 function buildDesktopBrowserContext(): string {
   return [
-    "# Desktop browser control — mcp__playwright__ tools drive REAL user tabs",
+    "# Desktop browser control — mcp__desktopbrowser__ tools drive REAL user tabs",
     "",
     "## ABSOLUTE RULE — read this first",
     "",
     "For ANY request to look at or act on a web page / browser / tab — read,",
     "scroll, click, type, navigate, screenshot, snapshot, fill a form, check a",
-    "site, \"see what's on my screen\" — you MUST use the `mcp__playwright__browser_*`",
+    "site, \"see what's on my screen\" — you MUST use the `mcp__desktopbrowser__browser_*`",
     "tools. They ARE the user's real, visible browser. This is non-negotiable.",
     "",
     "For acting on the user's pages you must NEVER:",
@@ -169,12 +169,12 @@ function buildDesktopBrowserContext(): string {
     "Those statements are FALSE here and the headless Docker Playwright is ONLY",
     "for when the user EXPLICITLY asks you to write or run automated tests — never",
     "for interacting with their live tabs. If you catch yourself reaching for a",
-    "script or Docker to view/act on a page, STOP and use the mcp__playwright__",
+    "script or Docker to view/act on a page, STOP and use the mcp__desktopbrowser__",
     "tools instead.",
     "",
     "## CRITICAL: which Playwright is this?",
     "",
-    "When `mcp__playwright__browser_*` tools are available (they are right",
+    "When `mcp__desktopbrowser__browser_*` tools are available (they are right",
     "now — that's why this section is in your context), they are connected",
     "to the **user's actual desktop app**, NOT a sandbox.",
     "",
@@ -232,7 +232,7 @@ function buildDesktopBrowserContext(): string {
     "",
     "Rule of thumb:",
     "- User says \"act on my tab\" / \"go to X\" / \"click Y\" / \"fill the form on Z\"",
-    "  → `mcp__playwright__browser_*` (this section).",
+    "  → `mcp__desktopbrowser__browser_*` (this section).",
     "- User says \"write me an E2E test\" / \"verify my login feature works\"",
     "  → `docker exec ai-ide-playwright npx playwright test` (next section).",
     "",
@@ -1969,7 +1969,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
           // turn-1 prompt instead of being deferred behind tool search,
           // so the model sees them immediately without an extra step.
           ...(PLAYWRIGHT_MCP_URL
-            ? { playwright: { type: "http" as const, url: PLAYWRIGHT_MCP_URL, alwaysLoad: true } }
+            ? { desktopbrowser: { type: "http" as const, url: PLAYWRIGHT_MCP_URL, alwaysLoad: true } }
             : {}),
         },
         // canUseTool is still passed for completeness — it'll just never
