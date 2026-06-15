@@ -118,7 +118,63 @@ export type PackInfo = {
   category?: string;
   port?: number;
   homepage?: string;
+  /** Whether the underlying tool/app is actually present on the system —
+   *  resolved by running the pack's check command (frontmatter `check:` or a
+   *  built-in for known packs). undefined = unknown (no check available). */
+  installed?: boolean;
 };
+
+/* Built-in "is it installed?" probes for well-known packs that have no web
+ * port to detect (CLI tools, dev environments). A pack can override/add its
+ * own by declaring `check:` in SKILL.md frontmatter. Exit 0 = installed. */
+const BUILTIN_CHECKS: { keys: string[]; cmd: string }[] = [
+  { keys: ["hyperframe"], cmd: "docker exec ai-ide-playwright sh -lc 'command -v hyperframes' >/dev/null 2>&1" },
+  { keys: ["gemini", "imagen"], cmd: "docker exec ai-ide-playwright test -f /opt/hyperframes/generate_asset.py" },
+  { keys: ["web-dev", "web dev", "webdev", "fullstack"], cmd: "command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1" },
+  { keys: ["dotnet", ".net"], cmd: "command -v dotnet >/dev/null 2>&1" },
+  { keys: ["playwright"], cmd: "docker ps --format '{{.Names}}' | grep -qx ai-ide-playwright" },
+];
+
+function builtinCheckFor(slug: string, name: string): string | undefined {
+  const hay = `${slug} ${name}`.toLowerCase();
+  return BUILTIN_CHECKS.find((c) => c.keys.some((k) => hay.includes(k)))?.cmd;
+}
+
+/** Run a shell check command; resolve true on exit 0, false otherwise (incl.
+ *  timeout / missing shell). Best-effort — never throws. */
+function runCheck(cmd: string, timeoutMs = 8000): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (v: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    let child;
+    try {
+      child = spawn("bash", ["-lc", cmd], { windowsHide: true });
+    } catch {
+      return finish(false);
+    }
+    const t = setTimeout(() => {
+      try {
+        child?.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      finish(false);
+    }, timeoutMs);
+    child.on("error", () => {
+      clearTimeout(t);
+      finish(false);
+    });
+    child.on("close", (code) => {
+      clearTimeout(t);
+      finish(code === 0);
+    });
+  });
+}
 
 /**
  * GET /api/packs
@@ -132,6 +188,7 @@ export type PackInfo = {
 export async function handleListPacks(c: Context): Promise<Response> {
   const skillsRoot = join(homedir(), ".claude", "skills");
   const packs: PackInfo[] = [];
+  const checkCmds = new Map<string, string | undefined>();
   let slugs: string[] = [];
   try {
     slugs = (await readdir(skillsRoot, { withFileTypes: true }))
@@ -153,9 +210,10 @@ export async function handleListPacks(c: Context): Promise<Response> {
     const frontmatter = fm ? fm[1] : "";
     const portRaw = fmField(frontmatter, "port");
     const port = portRaw && /^\d+$/.test(portRaw) ? Number(portRaw) : undefined;
+    const name = fmField(frontmatter, "name") ?? slug;
     packs.push({
       slug,
-      name: fmField(frontmatter, "name") ?? slug,
+      name,
       description: parseSkillDescription(content),
       icon: fmField(frontmatter, "icon"),
       color: fmField(frontmatter, "color"),
@@ -163,7 +221,18 @@ export async function handleListPacks(c: Context): Promise<Response> {
       port,
       homepage: fmField(frontmatter, "homepage"),
     });
+    // Stash the check command alongside (frontmatter `check:` wins, else a
+    // built-in for known packs). Resolved against the system below.
+    checkCmds.set(slug, fmField(frontmatter, "check") ?? builtinCheckFor(slug, name));
   }
+
+  // Probe the system for each pack that has a check command (parallel).
+  await Promise.all(
+    packs.map(async (p) => {
+      const cmd = checkCmds.get(p.slug);
+      if (cmd) p.installed = await runCheck(cmd);
+    })
+  );
 
   packs.sort((a, b) => a.slug.localeCompare(b.slug));
   return c.json({ packs });
