@@ -47,6 +47,10 @@ export interface ChatRequest {
   allowedTools?: string[];
   workingDirectory?: string;
   permissionMode?: "default" | "plan" | "acceptEdits" | "bypassPermissions";
+  /** Model id the turn should run on (e.g. "claude-opus-4-8"). When unset
+   *  the SDK falls back to its default model. Switched from the chat panel
+   *  via the /model command. */
+  model?: string;
   /** Image attachments — sent to Claude as multimodal content blocks
    *  instead of file mentions. */
   attachments?: ChatAttachmentPayload[];

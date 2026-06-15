@@ -1416,6 +1416,7 @@ export async function handleChatRequest(c: Context) {
     allowedTools,
     workingDirectory,
     permissionMode,
+    model,
     attachments,
     origin,
   } = body;
@@ -1473,6 +1474,7 @@ export async function handleChatRequest(c: Context) {
     sessionId,
     safeCwd,
     permissionMode,
+    model,
     allowedTools,
     attachments,
     abortController,
@@ -1488,6 +1490,7 @@ interface RunChatTaskArgs {
   sessionId?: string;
   safeCwd?: string;
   permissionMode?: ChatRequest["permissionMode"];
+  model?: string;
   allowedTools?: string[];
   attachments?: ChatRequest["attachments"];
   abortController: AbortController;
@@ -1656,6 +1659,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     sessionId,
     safeCwd,
     permissionMode,
+    model,
     allowedTools,
     attachments,
     abortController,
@@ -1986,6 +1990,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
         ...(safeCwd ? { cwd: safeCwd } : {}),
         allowedTools: mergedAllowedTools,
         disallowedTools: DISALLOWED_TOOLS,
+        ...(model ? { model } : {}),
         mcpServers: {
           aiide: createAiideMcpServer({ workspaceDir: safeCwd }),
           // Phase 4 — Playwright MCP via the reverse SSH tunnel to the

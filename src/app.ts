@@ -33,7 +33,7 @@ import {
 } from "./handlers/urls.js";
 import { handleEvents } from "./handlers/events.js";
 import { handleInstallPack } from "./handlers/packs.js";
-import { handleFileUpload as handleAssetUpload } from "./handlers/projectUpload.js";
+import { handleFileUpload as handleAssetUpload, handleChatUpload } from "./handlers/projectUpload.js";
 import {
   handleAvatarGet,
   handleAvatarUpload,
@@ -97,6 +97,10 @@ export function createApp(config: AppConfig) {
   // File/folder upload — saves files to the current working directory with
   // their relative paths intact (folder structure preserved).
   app.post("/api/files/upload", handleAssetUpload);
+
+  // Chat-panel attachments → saved verbatim into ~/upload so the agent can
+  // read them off disk by path.
+  app.post("/api/chat/upload", handleChatUpload);
 
   // Profile avatar — custom image stored on the instance (or bot default).
   app.get("/api/profile/avatar", handleAvatarGet);
