@@ -102,6 +102,73 @@ function parseSkillName(skillMd: string): string | null {
   return nameMatch[1].trim().replace(/^["']|["']$/g, "");
 }
 
+/** Pull one scalar frontmatter field (unquoted). */
+function fmField(frontmatter: string, key: string): string | undefined {
+  const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return m ? m[1].trim().replace(/^["']|["']$/g, "") : undefined;
+}
+
+export type PackInfo = {
+  slug: string;
+  name: string;
+  description: string;
+  /** Optional app metadata a pack may declare in its SKILL.md frontmatter. */
+  icon?: string;
+  color?: string;
+  category?: string;
+  port?: number;
+  homepage?: string;
+};
+
+/**
+ * GET /api/packs
+ *
+ * Lists every environment pack installed at ~/.claude/skills/ (folders with a
+ * SKILL.md). The App Store renders one card per pack. Beyond name/description
+ * we surface any optional app metadata a pack declares in its frontmatter
+ * (icon, color, category, port, homepage) so packs can present as polished
+ * apps without code changes.
+ */
+export async function handleListPacks(c: Context): Promise<Response> {
+  const skillsRoot = join(homedir(), ".claude", "skills");
+  const packs: PackInfo[] = [];
+  let slugs: string[] = [];
+  try {
+    slugs = (await readdir(skillsRoot, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return c.json({ packs: [] });
+  }
+
+  for (const slug of slugs) {
+    const skillMd = join(skillsRoot, slug, "SKILL.md");
+    let content: string;
+    try {
+      content = await readFile(skillMd, "utf8");
+    } catch {
+      continue; // no SKILL.md → not a pack
+    }
+    const fm = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/);
+    const frontmatter = fm ? fm[1] : "";
+    const portRaw = fmField(frontmatter, "port");
+    const port = portRaw && /^\d+$/.test(portRaw) ? Number(portRaw) : undefined;
+    packs.push({
+      slug,
+      name: fmField(frontmatter, "name") ?? slug,
+      description: parseSkillDescription(content),
+      icon: fmField(frontmatter, "icon"),
+      color: fmField(frontmatter, "color"),
+      category: fmField(frontmatter, "category"),
+      port,
+      homepage: fmField(frontmatter, "homepage"),
+    });
+  }
+
+  packs.sort((a, b) => a.slug.localeCompare(b.slug));
+  return c.json({ packs });
+}
+
 async function pathExists(p: string): Promise<boolean> {
   try {
     await access(p);

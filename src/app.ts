@@ -32,7 +32,7 @@ import {
   handleSetOpened,
 } from "./handlers/urls.js";
 import { handleEvents } from "./handlers/events.js";
-import { handleInstallPack } from "./handlers/packs.js";
+import { handleInstallPack, handleListPacks } from "./handlers/packs.js";
 import { handleFileUpload as handleAssetUpload, handleChatUpload } from "./handlers/projectUpload.js";
 import {
   handleAvatarGet,
@@ -165,6 +165,8 @@ export function createApp(config: AppConfig) {
   // Environment packs — install a Claude-Code-style skill from a URL
   // into ~/.claude/skills/<slug>/.
   app.post("/api/packs/install", handleInstallPack);
+  // List installed environment packs (~/.claude/skills) — drives the App Store.
+  app.get("/api/packs", handleListPacks);
 
   // Permission decision bridge — frontend posts here to resolve a
   // pending canUseTool callback inside an in-flight chat request.
