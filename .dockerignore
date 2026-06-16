@@ -1,0 +1,20 @@
+# Never copy host-built (Windows) native modules into the Linux image —
+# better-sqlite3 / node-pty must be recompiled inside the container.
+node_modules
+dist
+*.tsbuildinfo
+
+# Secrets + local config — env comes from docker-compose, not baked in.
+.env
+.env.*
+
+# The WhatsApp Go sidecar has its own image (backend/whatsapp/Dockerfile).
+whatsapp
+
+# VCS / docker / logs
+.git
+.gitignore
+Dockerfile
+.dockerignore
+npm-debug.log*
+*.log

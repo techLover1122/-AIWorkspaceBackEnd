@@ -1,0 +1,9 @@
+# Go module cache / build output (built inside the image).
+*.exe
+ai-ide-whatsapp
+
+# VCS / docker
+.git
+.gitignore
+Dockerfile
+.dockerignore
