@@ -26,6 +26,7 @@ import {
 import { runIntentGuard, denyIntentGuard } from "../middleware/intentGuardAgent.js";
 import { assessTool, createSessionHistory, recordApproval } from "../middleware/toolGuardAgent.js";
 import { runAnomalyDetection, type ExecutedAction } from "../middleware/anomalyDetectionAgent.js";
+import { onPresenceChange, isUserPresent } from "../utils/presenceTracker.js";
 import {
   notifyTaskDone,
   notifyPermission,
@@ -60,6 +61,19 @@ import {
  *     equivalent for partial-attended sessions.
  */
 const PERMISSION_WAIT_MS = 5 * 60 * 1000;
+
+/**
+ * Grace window after the LAST SSE stream closes before a still-pending
+ * permission auto-allows. This is the fix for the "Stream closed" hang:
+ * a permission that otherwise waits indefinitely (high-impact tools, or
+ * any tool while the user is mid-decision) would block forever if the
+ * browser's stream dies in a long chat — the frontend can never deliver
+ * a decision. The grace tolerates transient reconnects (which re-broadcast
+ * the prompt on reattach, see chatStream.ts) so a brief network blip
+ * doesn't trip it. Kept short relative to PERMISSION_WAIT_MS because a
+ * genuinely-closed stream is a stronger "user is gone" signal than idle.
+ */
+const STREAM_DEATH_GRACE_MS = 20 * 1000;
 
 // MCP tool names must be prefixed with `mcp__<server>__` in allowedTools.
 const MCP_TOOL_NAMES = [
@@ -1854,11 +1868,67 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       });
     }
 
+    // ───── Stream-death backstop — the "Stream closed" hang fix ─────
+    //
+    // The 5-min timer above only arms for routine, non-WhatsApp tools.
+    // Every other path ("waiting indefinitely") would hang FOREVER if the
+    // SSE stream to the browser dies mid-chat: the frontend can never POST
+    // a decision, so `await promise` never settles. Presence flips to
+    // "absent" the instant the last stream closes — when it stays closed
+    // past STREAM_DEATH_GRACE_MS (a reconnect re-broadcasts the prompt and
+    // flips us back to "present", disarming the timer), we auto-allow so
+    // the task keeps moving instead of stalling on a dead connection.
+    //
+    // Skipped when WhatsApp is linked: there an absent user is the handoff
+    // case — the prompt is already on their phone — so auto-allowing would
+    // race their reply.
+    let streamDeathTimer: ReturnType<typeof setTimeout> | null = null;
+    let offPresence: (() => void) | null = null;
+    if (!whatsappLinked) {
+      const armStreamDeath = () => {
+        if (streamDeathTimer) return;
+        streamDeathTimer = setTimeout(() => {
+          if (!openPermissions.has(id)) return;
+          info("canUseTool auto-allow (stream closed — backstop):", {
+            taskId,
+            id,
+            toolName,
+            toolUseId: options.toolUseID,
+            impactCategory: toolAssessment.impactCategory,
+          });
+          setTaskAbsentMode(taskId, true);
+          autoAllowPending(id);
+          openPermissions.delete(id);
+          pushEvent(taskId, {
+            type: "permission_resolved",
+            data: { id, decision: "auto-allow", reason: "stream-closed" },
+          });
+        }, STREAM_DEATH_GRACE_MS);
+      };
+      const disarmStreamDeath = () => {
+        if (streamDeathTimer) {
+          clearTimeout(streamDeathTimer);
+          streamDeathTimer = null;
+        }
+      };
+      // If the stream is already gone when this permission is raised, arm
+      // immediately rather than waiting for the next absent transition.
+      if (!isUserPresent()) armStreamDeath();
+      const offAbsent = onPresenceChange("absent", armStreamDeath);
+      const offPresent = onPresenceChange("present", disarmStreamDeath);
+      offPresence = () => {
+        offAbsent();
+        offPresent();
+        disarmStreamDeath();
+      };
+    }
+
     const onAbort = () => {
       if (denyPending(id, "Aborted by user")) {
         openPermissions.delete(id);
       }
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (offPresence) offPresence();
       cancelDeferredNotify(taskId, permKey);
     };
     options.signal.addEventListener("abort", onAbort, { once: true });
@@ -1868,6 +1938,7 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       return result;
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (offPresence) offPresence();
       cancelDeferredNotify(taskId, permKey);
       options.signal.removeEventListener("abort", onAbort);
     }
@@ -1966,9 +2037,21 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
     // canUseTool above become dead code under this override (canUseTool
     // is never called). Kept intact so flipping back to the asked-flow
     // is a one-line change.
-    // Tool Guard + Intent Guard are now active — permissions must flow
+    // Tool Guard + Intent Guard are active by default — permissions flow
     // through canUseTool so the guards can intercept.
-    const FORCE_BYPASS_PERMISSIONS = false;
+    //
+    // Two ways to bypass, both user-selectable:
+    //   1. Per-turn: the client sends `permissionMode: "bypassPermissions"`
+    //      (the bypass chip in the chat header). Honored as-is below via
+    //      `effectivePermissionMode` whenever the global override is off.
+    //   2. Global: set env FORCE_BYPASS_PERMISSIONS=true to force every
+    //      turn into bypass regardless of what the client sent — the
+    //      operator-level kill switch for the whole permission flow.
+    //
+    // Bypass skips canUseTool entirely, so Tool Guard / Intent Guard /
+    // the 5-min + stream-death backstops all become dead code under it.
+    const FORCE_BYPASS_PERMISSIONS =
+      process.env.FORCE_BYPASS_PERMISSIONS === "true";
     const effectivePermissionMode = FORCE_BYPASS_PERMISSIONS
       ? ("bypassPermissions" as const)
       : permissionMode;
