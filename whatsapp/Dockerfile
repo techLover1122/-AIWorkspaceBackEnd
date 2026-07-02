@@ -4,7 +4,7 @@
 # go.sum is generated during build (GOFLAGS=-mod=mod) since the repo ships
 # only go.mod.
 
-FROM golang:1.22-bookworm AS build
+FROM golang:1.25-bookworm AS build
 WORKDIR /src
 ENV CGO_ENABLED=1 GOFLAGS=-mod=mod
 COPY . .
