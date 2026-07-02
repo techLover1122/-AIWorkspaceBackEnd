@@ -1,6 +1,7 @@
 import { WebSocketServer, type WebSocket } from "ws";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import { info, error as logError } from "../utils/logger.js";
+import { verifyUpgradeRequest } from "./enterpriseAuth.js";
 
 /**
  * Terminal sessions are PTY-backed shells exposed over WebSocket. Each
@@ -174,8 +175,18 @@ export function attachTerminalWebSocket(
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname !== path) return;
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      void handleConnection(ws, req);
+    // Enterprise auth (no-op when AUTH_JWT_SECRET is unset) — the browser's
+    // session cookie rides along on same-origin upgrades; ?token= is the
+    // fallback for non-cookie clients.
+    void verifyUpgradeRequest(req.url ?? "/", req.headers.cookie).then((ok) => {
+      if (!ok) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        void handleConnection(ws, req);
+      });
     });
   });
   info(`[terminal] WebSocket route mounted at ${path}`);

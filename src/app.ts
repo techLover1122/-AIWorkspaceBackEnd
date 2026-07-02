@@ -11,6 +11,12 @@ import { handleConversationRequest } from "./handlers/conversations.js";
 import { handleStatusRequest } from "./handlers/status.js";
 import { handleSetApiKey, handleClearAuth } from "./handlers/auth.js";
 import {
+  enterpriseAuthMiddleware,
+  handleEnterpriseLogin,
+  handleAuthMe,
+  handleAuthLogout,
+} from "./handlers/enterpriseAuth.js";
+import {
   handleStartSubscription,
   handleSubscriptionStatus,
   handleCancelSubscription,
@@ -83,6 +89,13 @@ export function createApp(config: AppConfig) {
       credentials: true,
     })
   );
+
+  // Enterprise sign-in (Odoo-verified, opt-in via AUTH_JWT_SECRET) — gates
+  // every /api route below except the public list inside the middleware.
+  app.use("/api/*", enterpriseAuthMiddleware);
+  app.post("/api/auth/login", handleEnterpriseLogin);
+  app.get("/api/auth/me", handleAuthMe);
+  app.post("/api/auth/logout", handleAuthLogout);
 
   app.post("/api/chat", handleChatRequest);
   app.get("/api/chat/stream/:taskId", handleChatStreamRequest);
