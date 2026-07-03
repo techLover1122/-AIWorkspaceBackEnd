@@ -62,12 +62,25 @@ function tokenFromRequest(c: Context): string {
 }
 
 /**
- * Cookie options for the session. AUTH_COOKIE_DOMAIN (e.g. `.maesproject.com`)
- * widens the cookie to every subdomain so nginx `auth_request` can gate
- * sibling services (the embedded IDE) with the same sign-in.
+ * The cookie's Domain, widened to the registrable parent so nginx
+ * `auth_request` can gate sibling subdomains (IDE, Odoo) with the same
+ * sign-in. Derived from the request Host so ONE backend serves multiple
+ * domain families (maesproject.com AND bytescripterz.com) — each gets its
+ * own parent-domain cookie. AUTH_COOKIE_DOMAIN, if set, is a hard override.
+ * Returns "" for raw IPs / localhost (host-only cookie).
  */
+function cookieDomainFor(c: Context): string {
+  const override = process.env.AUTH_COOKIE_DOMAIN ?? "";
+  if (override) return override;
+  const host = (c.req.header("host") ?? "").split(":")[0];
+  if (!host || host === "localhost" || /^[0-9.]+$/.test(host)) return "";
+  const parts = host.split(".");
+  if (parts.length < 2) return "";
+  return `.${parts.slice(-2).join(".")}`;
+}
+
 function sessionCookieOptions(c: Context) {
-  const domain = process.env.AUTH_COOKIE_DOMAIN ?? "";
+  const domain = cookieDomainFor(c);
   return {
     path: "/",
     maxAge: TOKEN_TTL_S,
@@ -197,7 +210,7 @@ export async function handleAuthMe(c: Context) {
  *  Domain the cookie was set with, else the browser keeps the wider-domain
  *  cookie and the session survives. */
 export async function handleAuthLogout(c: Context) {
-  const domain = process.env.AUTH_COOKIE_DOMAIN ?? "";
+  const domain = cookieDomainFor(c);
   deleteCookie(c, COOKIE_NAME, { path: "/", ...(domain ? { domain } : {}) });
   return c.json({ ok: true });
 }
