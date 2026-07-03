@@ -62,6 +62,22 @@ function tokenFromRequest(c: Context): string {
 }
 
 /**
+ * Cookie options for the session. AUTH_COOKIE_DOMAIN (e.g. `.maesproject.com`)
+ * widens the cookie to every subdomain so nginx `auth_request` can gate
+ * sibling services (the embedded IDE) with the same sign-in.
+ */
+function sessionCookieOptions(c: Context) {
+  const domain = process.env.AUTH_COOKIE_DOMAIN ?? "";
+  return {
+    path: "/",
+    maxAge: TOKEN_TTL_S,
+    sameSite: "Lax" as const,
+    secure: (c.req.header("x-forwarded-proto") ?? "") === "https",
+    ...(domain ? { domain } : {}),
+  };
+}
+
+/**
  * Hono middleware gating every /api/* route (minus PUBLIC_PREFIXES) behind
  * a valid session token. Token sources: Authorization: Bearer, ?token=
  * (SSE/WS fallbacks), or the aiide_token cookie (the normal browser path).
@@ -117,12 +133,7 @@ export async function handleEnterpriseLogin(c: Context) {
       exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_S,
     };
     const token = await sign(claims as unknown as Record<string, unknown>, AUTH_SECRET());
-    setCookie(c, COOKIE_NAME, token, {
-      path: "/",
-      maxAge: TOKEN_TTL_S,
-      sameSite: "Lax",
-      secure: (c.req.header("x-forwarded-proto") ?? "") === "https",
-    });
+    setCookie(c, COOKIE_NAME, token, sessionCookieOptions(c));
     info(`enterprise login ok (fixed workspace user): ${login}`);
     return c.json({ token, user: { login, uid: 0, name: login } });
   }
@@ -164,12 +175,7 @@ export async function handleEnterpriseLogin(c: Context) {
   // Same-site cookie so every subsequent fetch/SSE/WS from the workspace UI
   // carries the session automatically. `secure` only when the request came
   // in over https (nginx sets x-forwarded-proto).
-  setCookie(c, COOKIE_NAME, token, {
-    path: "/",
-    maxAge: TOKEN_TTL_S,
-    sameSite: "Lax",
-    secure: (c.req.header("x-forwarded-proto") ?? "") === "https",
-  });
+  setCookie(c, COOKIE_NAME, token, sessionCookieOptions(c));
   info(`enterprise login ok: ${login} (uid ${claims.uid})`);
   return c.json({ token, user: { login, uid: claims.uid, name: claims.name } });
 }
