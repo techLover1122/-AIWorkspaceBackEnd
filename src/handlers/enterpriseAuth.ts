@@ -193,8 +193,11 @@ export async function handleAuthMe(c: Context) {
   return c.json({ authRequired: true, user: { login: claims.sub, uid: claims.uid, name: claims.name } });
 }
 
-/** POST /api/auth/logout — clears the session cookie. */
+/** POST /api/auth/logout — clears the session cookie. Must pass the same
+ *  Domain the cookie was set with, else the browser keeps the wider-domain
+ *  cookie and the session survives. */
 export async function handleAuthLogout(c: Context) {
-  deleteCookie(c, COOKIE_NAME, { path: "/" });
+  const domain = process.env.AUTH_COOKIE_DOMAIN ?? "";
+  deleteCookie(c, COOKIE_NAME, { path: "/", ...(domain ? { domain } : {}) });
   return c.json({ ok: true });
 }
