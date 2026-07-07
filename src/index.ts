@@ -5,6 +5,7 @@ import { createApp } from "./app.js";
 import { attachTerminalWebSocket } from "./handlers/terminal.js";
 import { info } from "./utils/logger.js";
 import { warmStartClaudeCli } from "./utils/claudeCli.js";
+import { startSnapshotCleanup } from "./middleware/snapshotGuardAgent.js";
 
 const port = parseInt(process.env.PORT ?? "8090", 10);
 const host = process.env.HOST ?? "127.0.0.1";
@@ -17,6 +18,11 @@ async function main() {
   }
 
   const app = createApp({ port, host, debug, claudePath: detected });
+
+  // EBA Snapshot Guard (4th security layer) — start the 24h retention sweep
+  // that deletes snapshots older than a day. Capture itself is wired into the
+  // chat pipeline via the SDK PreToolUse hook (see handlers/chat.ts).
+  startSnapshotCleanup();
 
   const server = serve(
     {

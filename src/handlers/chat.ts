@@ -1,5 +1,5 @@
 import { Context } from "hono";
-import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
+import { query, type CanUseTool, type HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +26,7 @@ import {
 import { runIntentGuard, denyIntentGuard } from "../middleware/intentGuardAgent.js";
 import { assessTool, createSessionHistory, recordApproval } from "../middleware/toolGuardAgent.js";
 import { runAnomalyDetection, type ExecutedAction } from "../middleware/anomalyDetectionAgent.js";
+import { isCodeChangeTool, captureProjectSnapshot } from "../middleware/snapshotGuardAgent.js";
 import { onPresenceChange, isUserPresent } from "../utils/presenceTracker.js";
 import {
   notifyTaskDone,
@@ -2064,6 +2065,40 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       });
     }
 
+    // ───── EBA Snapshot Guard — the 4th security layer ─────
+    // Fires on the SDK PreToolUse hook, which runs even under
+    // bypassPermissions — canUseTool does NOT (the SDK skips it in that mode,
+    // which is the default runtime). Before the FIRST code-changing tool of
+    // this turn, take a whole-project snapshot of the working dir so the
+    // pre-change state is recoverable for 24h. Read-only turns snapshot
+    // nothing; any snapshot error is swallowed so it never blocks the edit.
+    let snapshotTakenThisTurn = false;
+    const snapshotHook: HookCallback = async (input) => {
+      try {
+        if (
+          input.hook_event_name === "PreToolUse" &&
+          !snapshotTakenThisTurn &&
+          safeCwd &&
+          isCodeChangeTool(input.tool_name, input.tool_input)
+        ) {
+          // Flip the flag BEFORE awaiting so parallel tool calls in one batch
+          // can't each kick off a duplicate whole-project copy.
+          snapshotTakenThisTurn = true;
+          await captureProjectSnapshot({
+            taskId,
+            cwd: safeCwd,
+            tool: input.tool_name,
+          });
+        }
+      } catch (e) {
+        warn("EBA snapshot hook error (edit allowed to proceed):", {
+          taskId,
+          error: String(e),
+        });
+      }
+      return { continue: true };
+    };
+
     const response = query({
       prompt: promptInput,
       options: {
@@ -2089,6 +2124,11 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
         // FORCE_BYPASS_PERMISSIONS = false re-enables the gate flow
         // without further code changes.
         canUseTool,
+        // EBA Snapshot Guard — PreToolUse fires regardless of permissionMode,
+        // so the pre-change snapshot is taken even when canUseTool is bypassed.
+        hooks: {
+          PreToolUse: [{ hooks: [snapshotHook] }],
+        },
         ...(effectivePermissionMode ? { permissionMode: effectivePermissionMode } : {}),
         ...(appendedSystem ? { appendSystemPrompt: appendedSystem } : {}),
         includePartialMessages: true,
