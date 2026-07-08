@@ -47,6 +47,7 @@ import {
 } from "./handlers/profile.js";
 import { handlePermissionDecision } from "./handlers/permission.js";
 import { handleIntentGuardDecision } from "./handlers/intentGuard.js";
+import { handleBackupRequest } from "./handlers/backup.js";
 import {
   handleListServices,
   handleRegisterService,
@@ -101,6 +102,10 @@ export function createApp(config: AppConfig) {
   app.get("/api/chat/stream/:taskId", handleChatStreamRequest);
   app.get("/api/chat/active", handleActiveTasksRequest);
   app.post("/api/abort/:requestId", handleAbortRequest);
+
+  // Workspace backup — runs scripts/eba-backup.sh (project + Postgres DB → S3,
+  // with retry, local cleanup, 24h S3 prune) and streams progress via SSE.
+  app.post("/api/backup", handleBackupRequest);
   app.get("/api/projects", handleProjectsRequest);
   app.get("/api/projects/:encodedProjectName/histories", handleHistoriesRequest);
   app.get("/api/projects/:encodedProjectName/histories/:sessionId", handleConversationRequest);
