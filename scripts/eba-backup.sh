@@ -210,14 +210,22 @@ ok "pruned $pruned old object(s)"
 
 echo "${BOLD}${GREEN}╚═══ DONE ✓  ${SIZE}  in ${SECONDS}s ═══╝${RESET}"
 
-# ---- Working links to the backup (s3:// is not a browser URL, and the bucket
-#      is private — so print a presigned HTTPS link + the console deep-link) ----
+# ---- Links to the backup ----
+# s3:// is not a browser URL, and the bucket is private. Safe defaults: the
+# console deep-link (needs an AWS console login — no public grant) and a
+# download command. A presigned "anyone-with-link" HTTPS URL is only printed
+# when explicitly opted in with PRESIGN_LINK=1, because it grants read access
+# to the backup (which contains the DB dump) to anyone who sees the link.
 detail "S3 URI  : s3://$S3_BUCKET/$KEY"
 detail "Console : https://s3.console.aws.amazon.com/s3/object/$S3_BUCKET/$KEY?region=$AWS_REGION"
-DL_URL="$(aws s3 presign "s3://$S3_BUCKET/$KEY" --expires-in "$LINK_EXPIRY" --region "$AWS_REGION" 2>/dev/null || true)"
-if [ -n "$DL_URL" ]; then
-  echo "  ${BOLD}${BLUE}⬇ Download link${RESET} ${DIM}(opens in any browser, valid ${LINK_EXPIRY}s):${RESET}"
-  echo "  $DL_URL"
+if [ "${PRESIGN_LINK:-0}" = "1" ]; then
+  DL_URL="$(aws s3 presign "s3://$S3_BUCKET/$KEY" --expires-in "$LINK_EXPIRY" --region "$AWS_REGION" 2>/dev/null || true)"
+  if [ -n "$DL_URL" ]; then
+    echo "  ${BOLD}${BLUE}⬇ Shareable download link${RESET} ${DIM}(anyone-with-link, valid ${LINK_EXPIRY}s):${RESET}"
+    echo "  $DL_URL"
+  else
+    warnln "could not generate a presigned link (check aws creds)"
+  fi
 else
-  warnln "could not generate a presigned link (check aws creds)"
+  detail "Download: aws s3 cp s3://$S3_BUCKET/$KEY .   ${DIM}(or PRESIGN_LINK=1 for a shareable browser link)${RESET}"
 fi
