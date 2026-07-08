@@ -31,6 +31,7 @@ S3_PREFIX="${S3_PREFIX:-backups}"
 AWS_REGION="${AWS_REGION:-eu-north-1}"
 RETENTION_HOURS="${RETENTION_HOURS:-24}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
+LINK_EXPIRY="${LINK_EXPIRY:-86400}"               # presigned download-link validity (s); max 604800 (7d)
 
 MSSQL_CONTAINER="${MSSQL_CONTAINER:-mssql2022}"
 # MSSQL is OFF by default (the MAES_HS_CVBA_LIVE DB is large legacy data we skip).
@@ -207,4 +208,16 @@ done < <(aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$S3_PREFIX/" 
   --region "$AWS_REGION" --query "Contents[].[Key,LastModified]" --output text 2>/dev/null)
 ok "pruned $pruned old object(s)"
 
-echo "${BOLD}${GREEN}╚═══ DONE ✓  ${SIZE}  in ${SECONDS}s  →  s3://$S3_BUCKET/$KEY ═══╝${RESET}"
+echo "${BOLD}${GREEN}╚═══ DONE ✓  ${SIZE}  in ${SECONDS}s ═══╝${RESET}"
+
+# ---- Working links to the backup (s3:// is not a browser URL, and the bucket
+#      is private — so print a presigned HTTPS link + the console deep-link) ----
+detail "S3 URI  : s3://$S3_BUCKET/$KEY"
+detail "Console : https://s3.console.aws.amazon.com/s3/object/$S3_BUCKET/$KEY?region=$AWS_REGION"
+DL_URL="$(aws s3 presign "s3://$S3_BUCKET/$KEY" --expires-in "$LINK_EXPIRY" --region "$AWS_REGION" 2>/dev/null || true)"
+if [ -n "$DL_URL" ]; then
+  echo "  ${BOLD}${BLUE}⬇ Download link${RESET} ${DIM}(opens in any browser, valid ${LINK_EXPIRY}s):${RESET}"
+  echo "  $DL_URL"
+else
+  warnln "could not generate a presigned link (check aws creds)"
+fi
