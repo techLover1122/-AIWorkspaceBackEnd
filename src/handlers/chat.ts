@@ -2377,11 +2377,26 @@ async function runChatTask(args: RunChatTaskArgs): Promise<void> {
       // SDK string is cryptic and leaves the user stuck. Surface an
       // actionable message instead.
       const isPromptTooLong = /prompt is too long/i.test(msgText);
+      // The SDK throws this when the CLI subprocess's own control-stream
+      // (not the browser SSE — see the stream-death backstop above, which
+      // only covers that case) closes while a canUseTool call is still
+      // in flight — e.g. the child process crashed or got reaped while a
+      // high-impact/WhatsApp permission was waiting indefinitely for a
+      // decision. The session transcript is persisted by the SDK, so
+      // resuming (this code already passes `resume: sessionId`) picks
+      // the conversation back up — surface that instead of the raw
+      // SDK-internal wording.
+      const isStreamClosed = /tool permission request failed/i.test(msgText)
+        && /stream closed/i.test(msgText);
       const userFacing = isPromptTooLong
         ? "This conversation grew too large for the model's context window. " +
           "Auto-compaction is enabled and normally shrinks it automatically, " +
           "but this session is big enough that it couldn't recover. Start a " +
           "new chat to continue — your files and work are unaffected."
+        : isStreamClosed
+        ? "The connection to the assistant process dropped while a permission " +
+          "was pending. Nothing was lost — just send your next message and " +
+          "the conversation will pick up where it left off."
         : msgText;
       pushEvent(taskId, { type: "error", error: userFacing });
       setTaskStatus(taskId, "error");
